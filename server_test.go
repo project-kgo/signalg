@@ -182,6 +182,70 @@ func TestHandlerUserProvider(t *testing.T) {
 	})
 }
 
+func TestHandlerUserConnectionIndex(t *testing.T) {
+	connected := make(chan *Connection, 2)
+	disconnected := make(chan error, 2)
+	handler := newTestHandler(t, Config{
+		UserProvider: UserProviderFunc(func(r *http.Request) (string, error) {
+			return r.Header.Get("X-User-ID"), nil
+		}),
+	}, func(*Connection) (Hub, error) {
+		return &recordingHub{
+			connected:    connected,
+			disconnected: disconnected,
+		}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	opts := &websocket.DialOptions{
+		HTTPHeader: http.Header{"X-User-ID": []string{"user-1"}},
+	}
+	client1 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, opts)
+	defer client1.CloseNow()
+	client2 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, opts)
+	defer client2.CloseNow()
+
+	conn1 := receiveConnection(t, connected)
+	conn2 := receiveConnection(t, connected)
+
+	if got := handler.UserOnline("user-1"); got != 2 {
+		t.Fatalf("expected user-1 online 2, got %d", got)
+	}
+	if got := handler.UserOnline(""); got != 0 {
+		t.Fatalf("expected anonymous online 0, got %d", got)
+	}
+	if got := handler.UserOnline("missing"); got != 0 {
+		t.Fatalf("expected missing user online 0, got %d", got)
+	}
+
+	userConnections := handler.UserConnections("user-1")
+	if len(userConnections) != 2 {
+		t.Fatalf("expected 2 user connections, got %d", len(userConnections))
+	}
+	assertContainsConnection(t, userConnections, conn1)
+	assertContainsConnection(t, userConnections, conn2)
+
+	if err := client1.Close(websocket.StatusNormalClosure, "done"); err != nil {
+		t.Fatalf("close first client: %v", err)
+	}
+	receiveDisconnect(t, disconnected)
+	if got := handler.UserOnline("user-1"); got != 1 {
+		t.Fatalf("expected user-1 online 1, got %d", got)
+	}
+
+	if err := client2.Close(websocket.StatusNormalClosure, "done"); err != nil {
+		t.Fatalf("close second client: %v", err)
+	}
+	receiveDisconnect(t, disconnected)
+	if got := handler.UserOnline("user-1"); got != 0 {
+		t.Fatalf("expected user-1 online 0, got %d", got)
+	}
+	if got := handler.UserConnections("user-1"); len(got) != 0 {
+		t.Fatalf("expected no user connections, got %d", len(got))
+	}
+}
+
 func TestHandlerRejectsUnexpectedPath(t *testing.T) {
 	handler := newTestHandler(t, Config{}, func(*Connection) (Hub, error) {
 		return &recordingHub{}, nil
@@ -398,6 +462,17 @@ func receiveDisconnect(t *testing.T, ch <-chan error) error {
 		t.Fatal("timed out waiting for disconnect")
 		return nil
 	}
+}
+
+func assertContainsConnection(t *testing.T, connections []*Connection, want *Connection) {
+	t.Helper()
+
+	for _, conn := range connections {
+		if conn == want {
+			return
+		}
+	}
+	t.Fatalf("expected connections to contain %s", want.ID)
 }
 
 func httpToWS(url string) string {

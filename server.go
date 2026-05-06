@@ -70,9 +70,10 @@ type Handler struct {
 	factory HubFactory
 	logger  *slog.Logger
 
-	mu          sync.Mutex
-	connections map[*Connection]struct{}
-	online      atomic.Int64
+	mu            sync.RWMutex
+	connections   map[*Connection]struct{}
+	userConnIndex map[string]map[*Connection]struct{}
+	online        atomic.Int64
 }
 
 // ServerConfig configures a standalone SignalG websocket server.
@@ -106,10 +107,11 @@ func NewHandler(cfg Config, factory HubFactory) (*Handler, error) {
 	}
 
 	return &Handler{
-		cfg:         cfg,
-		factory:     factory,
-		logger:      cfg.Logger,
-		connections: make(map[*Connection]struct{}),
+		cfg:           cfg,
+		factory:       factory,
+		logger:        cfg.Logger,
+		connections:   make(map[*Connection]struct{}),
+		userConnIndex: make(map[string]map[*Connection]struct{}),
 	}, nil
 }
 
@@ -215,6 +217,33 @@ func (h *Handler) Online() int {
 	return int(h.online.Load())
 }
 
+// UserOnline returns the current active websocket connection count for a user.
+func (h *Handler) UserOnline(userID string) int {
+	if userID == "" {
+		return 0
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.userConnIndex[userID])
+}
+
+// UserConnections returns a snapshot of active websocket connections for a user.
+func (h *Handler) UserConnections(userID string) []*Connection {
+	if userID == "" {
+		return nil
+	}
+
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	userConnections := h.userConnIndex[userID]
+	connections := make([]*Connection, 0, len(userConnections))
+	for conn := range userConnections {
+		connections = append(connections, conn)
+	}
+	return connections
+}
+
 func (h *Handler) acceptOptions() *websocket.AcceptOptions {
 	opts := &websocket.AcceptOptions{
 		Subprotocols:         h.cfg.Subprotocols,
@@ -240,6 +269,14 @@ func (h *Handler) resolveUserID(r *http.Request) (string, error) {
 func (h *Handler) addConnection(conn *Connection) {
 	h.mu.Lock()
 	h.connections[conn] = struct{}{}
+	if conn.UserID != "" {
+		userConnections := h.userConnIndex[conn.UserID]
+		if userConnections == nil {
+			userConnections = make(map[*Connection]struct{})
+			h.userConnIndex[conn.UserID] = userConnections
+		}
+		userConnections[conn] = struct{}{}
+	}
 	h.mu.Unlock()
 	h.online.Add(1)
 }
@@ -247,17 +284,24 @@ func (h *Handler) addConnection(conn *Connection) {
 func (h *Handler) removeConnection(conn *Connection) {
 	h.mu.Lock()
 	delete(h.connections, conn)
+	if conn.UserID != "" {
+		userConnections := h.userConnIndex[conn.UserID]
+		delete(userConnections, conn)
+		if len(userConnections) == 0 {
+			delete(h.userConnIndex, conn.UserID)
+		}
+	}
 	h.mu.Unlock()
 	h.online.Add(-1)
 }
 
 func (h *Handler) closeActive(_ websocket.StatusCode, _ string) {
-	h.mu.Lock()
+	h.mu.RLock()
 	connections := make([]*Connection, 0, len(h.connections))
 	for conn := range h.connections {
 		connections = append(connections, conn)
 	}
-	h.mu.Unlock()
+	h.mu.RUnlock()
 
 	for _, conn := range connections {
 		_ = conn.closeNow()
@@ -362,6 +406,16 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // Online returns the current active websocket connection count.
 func (s *Server) Online() int {
 	return s.handler.Online()
+}
+
+// UserOnline returns the current active websocket connection count for a user.
+func (s *Server) UserOnline(userID string) int {
+	return s.handler.UserOnline(userID)
+}
+
+// UserConnections returns a snapshot of active websocket connections for a user.
+func (s *Server) UserConnections(userID string) []*Connection {
+	return s.handler.UserConnections(userID)
 }
 
 func normalizePath(p string) string {
