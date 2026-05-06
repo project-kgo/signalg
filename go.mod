@@ -5,6 +5,7 @@ go 1.26
 require (
 	github.com/cloudwego/hertz v0.10.4
 	github.com/coder/websocket v1.8.14
+	github.com/matoous/go-nanoid/v2 v2.1.0
 )
 
 require (

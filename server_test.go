@@ -107,6 +107,9 @@ func TestHandlerConnectionLifecycle(t *testing.T) {
 	if conn.ID == "" {
 		t.Fatal("expected connection id")
 	}
+	if conn.UserID != "" {
+		t.Fatalf("expected empty user id, got %q", conn.UserID)
+	}
 	if conn.Request == nil {
 		t.Fatal("expected request")
 	}
@@ -127,6 +130,56 @@ func TestHandlerConnectionLifecycle(t *testing.T) {
 		t.Fatalf("close client: %v", err)
 	}
 	receiveDisconnect(t, disconnected)
+}
+
+func TestHandlerUserProvider(t *testing.T) {
+	t.Run("resolves user id before hub factory", func(t *testing.T) {
+		connected := make(chan *Connection, 1)
+		handler := newTestHandler(t, Config{
+			UserProvider: UserProviderFunc(func(r *http.Request) (string, error) {
+				return r.Header.Get("X-User-ID"), nil
+			}),
+		}, func(conn *Connection) (Hub, error) {
+			if conn.UserID != "user-1" {
+				t.Fatalf("expected user id user-1, got %q", conn.UserID)
+			}
+			return &recordingHub{connected: connected}, nil
+		})
+		server := httptest.NewServer(handler)
+		defer server.Close()
+
+		client := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, &websocket.DialOptions{
+			HTTPHeader: http.Header{"X-User-ID": []string{"user-1"}},
+		})
+		defer client.CloseNow()
+
+		conn := receiveConnection(t, connected)
+		if conn.UserID != "user-1" {
+			t.Fatalf("expected user id user-1, got %q", conn.UserID)
+		}
+	})
+
+	t.Run("rejects when user provider fails", func(t *testing.T) {
+		connected := make(chan *Connection, 1)
+		handler := newTestHandler(t, Config{
+			UserProvider: UserProviderFunc(func(*http.Request) (string, error) {
+				return "", errors.New("missing user")
+			}),
+		}, func(*Connection) (Hub, error) {
+			return &recordingHub{connected: connected}, nil
+		})
+		server := httptest.NewServer(handler)
+		defer server.Close()
+
+		client := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+		defer client.CloseNow()
+
+		select {
+		case conn := <-connected:
+			t.Fatalf("expected hub not to connect, got %s", conn.ID)
+		case <-time.After(100 * time.Millisecond):
+		}
+	})
 }
 
 func TestHandlerRejectsUnexpectedPath(t *testing.T) {

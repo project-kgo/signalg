@@ -12,6 +12,7 @@ import (
 // Connection represents one websocket connection managed by SignalG.
 type Connection struct {
 	ID      string
+	UserID  string
 	Request *http.Request
 
 	ctx        context.Context
@@ -21,10 +22,11 @@ type Connection struct {
 	remoteAddr net.Addr
 }
 
-func newConnection(id string, request *http.Request, ws *websocket.Conn) *Connection {
+func newConnection(id, userID string, request *http.Request, ws *websocket.Conn) *Connection {
 	ctx, cancel := context.WithCancel(context.Background())
 	conn := &Connection{
 		ID:     id,
+		UserID: userID,
 		ctx:    ctx,
 		cancel: cancel,
 		ws:     ws,

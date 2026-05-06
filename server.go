@@ -7,13 +7,13 @@ import (
 	"net"
 	"net/http"
 	"path"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
+	gonanoid "github.com/matoous/go-nanoid/v2"
 )
 
 const (
@@ -27,8 +27,6 @@ var (
 	ErrNilHub        = errors.New("signalg: hub factory returned nil hub")
 )
 
-var connectionID uint64
-
 // Hub handles lifecycle events for one websocket connection.
 type Hub interface {
 	OnConnected(ctx context.Context, conn *Connection) error
@@ -38,11 +36,25 @@ type Hub interface {
 // HubFactory creates one Hub instance for one websocket connection.
 type HubFactory func(conn *Connection) (Hub, error)
 
+// UserProvider resolves a business user id from the websocket handshake request.
+type UserProvider interface {
+	GetUserID(r *http.Request) (string, error)
+}
+
+// UserProviderFunc adapts a function to UserProvider.
+type UserProviderFunc func(r *http.Request) (string, error)
+
+// GetUserID resolves a business user id from the websocket handshake request.
+func (f UserProviderFunc) GetUserID(r *http.Request) (string, error) {
+	return f(r)
+}
+
 // Config configures the SignalG websocket handler.
 type Config struct {
 	Path   string
 	Logger *slog.Logger
 
+	UserProvider         UserProvider
 	CheckOrigin          func(*http.Request) bool
 	OriginPatterns       []string
 	InsecureSkipVerify   bool
@@ -122,7 +134,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn := newConnection(nextConnectionID(), r, ws)
+	connectionID, err := nextConnectionID()
+	if err != nil {
+		h.logger.Error("failed to generate connection id",
+			slog.String("remote_addr", r.RemoteAddr),
+			slog.Any("error", err),
+		)
+		_ = ws.CloseNow()
+		return
+	}
+
+	userID, err := h.resolveUserID(r)
+	if err != nil {
+		h.logger.Error("failed to resolve user id",
+			slog.String("connection_id", connectionID),
+			slog.String("remote_addr", r.RemoteAddr),
+			slog.Any("error", err),
+		)
+		_ = ws.CloseNow()
+		return
+	}
+
+	conn := newConnection(connectionID, userID, r, ws)
 	if h.cfg.ReadLimit > 0 {
 		ws.SetReadLimit(h.cfg.ReadLimit)
 	}
@@ -195,6 +228,13 @@ func (h *Handler) acceptOptions() *websocket.AcceptOptions {
 		opts.OriginPatterns = nil
 	}
 	return opts
+}
+
+func (h *Handler) resolveUserID(r *http.Request) (string, error) {
+	if h.cfg.UserProvider == nil {
+		return "", nil
+	}
+	return h.cfg.UserProvider.GetUserID(r)
 }
 
 func (h *Handler) addConnection(conn *Connection) {
@@ -335,8 +375,8 @@ func normalizePath(p string) string {
 	return path.Clean(p)
 }
 
-func nextConnectionID() string {
-	return strconv.FormatUint(atomic.AddUint64(&connectionID, 1), 36)
+func nextConnectionID() (string, error) {
+	return gonanoid.New(16)
 }
 
 func remoteAddr(conn *Connection) string {
