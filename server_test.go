@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,6 +34,15 @@ func TestNewHandlerValidationAndDefaults(t *testing.T) {
 	if handler.logger == nil {
 		t.Fatal("expected default logger")
 	}
+	if handler.cfg.Serialization != SerializationMessagePack {
+		t.Fatalf("expected default serialization messagepack, got %s", handler.cfg.Serialization)
+	}
+	if handler.protocol.maxPayloadSize != DefaultMaxPayloadSize {
+		t.Fatalf("expected default max payload %d, got %d", DefaultMaxPayloadSize, handler.protocol.maxPayloadSize)
+	}
+	if handler.cfg.ReadLimit != HeaderSize+DefaultMaxPayloadSize {
+		t.Fatalf("expected default read limit %d, got %d", HeaderSize+DefaultMaxPayloadSize, handler.cfg.ReadLimit)
+	}
 
 	handler, err = NewHandler(Config{Path: "custom"}, func(*Connection) (Hub, error) {
 		return &recordingHub{}, nil
@@ -42,6 +52,13 @@ func TestNewHandlerValidationAndDefaults(t *testing.T) {
 	}
 	if handler.cfg.Path != "/custom" {
 		t.Fatalf("expected normalized path /custom, got %q", handler.cfg.Path)
+	}
+
+	_, err = NewHandler(Config{Serialization: Serialization(99)}, func(*Connection) (Hub, error) {
+		return &recordingHub{}, nil
+	})
+	if !errors.Is(err, ErrUnsupportedCodec) {
+		t.Fatalf("expected ErrUnsupportedCodec, got %v", err)
 	}
 }
 
@@ -130,6 +147,133 @@ func TestHandlerConnectionLifecycle(t *testing.T) {
 		t.Fatalf("close client: %v", err)
 	}
 	receiveDisconnect(t, disconnected)
+}
+
+func TestConnectionSendWritesProtocolFrame(t *testing.T) {
+	connected := make(chan *Connection, 1)
+	handler := newTestHandler(t, Config{}, func(*Connection) (Hub, error) {
+		return &recordingHub{connected: connected}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client.CloseNow()
+
+	conn := receiveConnection(t, connected)
+	if err := conn.Send(context.Background(), 11, protocolTestBody{Name: "server", Seq: 3}); err != nil {
+		t.Fatalf("Send returned error: %v", err)
+	}
+
+	typ, frame, err := client.Read(context.Background())
+	if err != nil {
+		t.Fatalf("client read: %v", err)
+	}
+	if typ != websocket.MessageBinary {
+		t.Fatalf("expected binary message, got %s", typ)
+	}
+	msg, err := handler.protocol.decodeFrame(frame)
+	if err != nil {
+		t.Fatalf("decodeFrame returned error: %v", err)
+	}
+	if msg.Type != 11 {
+		t.Fatalf("expected message type 11, got %d", msg.Type)
+	}
+	var got protocolTestBody
+	if err = msg.Decode(&got); err != nil {
+		t.Fatalf("Decode returned error: %v", err)
+	}
+	if got.Name != "server" || got.Seq != 3 {
+		t.Fatalf("unexpected decoded body: %#v", got)
+	}
+}
+
+func TestMessageHubReceivesProtocolMessage(t *testing.T) {
+	messages := make(chan Message, 1)
+	handler := newTestHandler(t, Config{Serialization: SerializationJSON}, func(*Connection) (Hub, error) {
+		return &recordingMessageHub{messages: messages}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client.CloseNow()
+
+	frame := encodeTestFrame(t, handler.protocol.codec, 12, protocolTestBody{Name: "client", Seq: 4})
+	if err := client.Write(context.Background(), websocket.MessageBinary, frame); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+
+	select {
+	case msg := <-messages:
+		if msg.Type != 12 {
+			t.Fatalf("expected message type 12, got %d", msg.Type)
+		}
+		var got protocolTestBody
+		if err := msg.Decode(&got); err != nil {
+			t.Fatalf("Decode returned error: %v", err)
+		}
+		if got.Name != "client" || got.Seq != 4 {
+			t.Fatalf("unexpected decoded body: %#v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for protocol message")
+	}
+}
+
+func TestConnectionSendConcurrent(t *testing.T) {
+	connected := make(chan *Connection, 1)
+	handler := newTestHandler(t, Config{}, func(*Connection) (Hub, error) {
+		return &recordingHub{connected: connected}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client.CloseNow()
+
+	conn := receiveConnection(t, connected)
+	const sends = 16
+
+	errs := make(chan error, sends)
+	var wg sync.WaitGroup
+	wg.Add(sends)
+	for i := 0; i < sends; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			errs <- conn.SendRaw(context.Background(), MessageType(100+i), []byte{byte(i)})
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("SendRaw returned error: %v", err)
+		}
+	}
+
+	seen := make(map[MessageType]struct{}, sends)
+	for i := 0; i < sends; i++ {
+		typ, frame, err := client.Read(context.Background())
+		if err != nil {
+			t.Fatalf("client read %d: %v", i, err)
+		}
+		if typ != websocket.MessageBinary {
+			t.Fatalf("expected binary message, got %s", typ)
+		}
+		msg, err := handler.protocol.decodeFrame(frame)
+		if err != nil {
+			t.Fatalf("decodeFrame returned error: %v", err)
+		}
+		seen[msg.Type] = struct{}{}
+	}
+	for i := 0; i < sends; i++ {
+		msgType := MessageType(100 + i)
+		if _, ok := seen[msgType]; !ok {
+			t.Fatalf("missing sent message type %d", msgType)
+		}
+	}
 }
 
 func TestHandlerUserProvider(t *testing.T) {
@@ -371,6 +515,22 @@ func (h *recordingHub) OnDisconnected(_ context.Context, _ *Connection, err erro
 	if h.disconnected != nil {
 		h.disconnected <- err
 	}
+}
+
+type recordingMessageHub struct {
+	recordingHub
+	messages  chan Message
+	onMessage func(context.Context, *Connection, Message) error
+}
+
+func (h *recordingMessageHub) OnMessage(ctx context.Context, conn *Connection, msg Message) error {
+	if h.onMessage != nil {
+		return h.onMessage(ctx, conn, msg)
+	}
+	if h.messages != nil {
+		h.messages <- msg
+	}
+	return nil
 }
 
 func newTestHandler(t *testing.T, cfg Config, factory HubFactory) *Handler {

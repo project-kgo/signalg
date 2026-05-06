@@ -33,6 +33,11 @@ type Hub interface {
 	OnDisconnected(ctx context.Context, conn *Connection, err error)
 }
 
+// MessageHub receives decoded SignalG protocol messages from a connection.
+type MessageHub interface {
+	OnMessage(ctx context.Context, conn *Connection, msg Message) error
+}
+
 // HubFactory creates one Hub instance for one websocket connection.
 type HubFactory func(conn *Connection) (Hub, error)
 
@@ -62,13 +67,16 @@ type Config struct {
 	CompressionMode      websocket.CompressionMode
 	CompressionThreshold int
 	ReadLimit            int64
+	Serialization        Serialization
+	MaxPayloadSize       int64
 }
 
 // Handler accepts websocket requests and dispatches lifecycle events to hubs.
 type Handler struct {
-	cfg     Config
-	factory HubFactory
-	logger  *slog.Logger
+	cfg      Config
+	factory  HubFactory
+	logger   *slog.Logger
+	protocol *protocolConfig
 
 	mu            sync.RWMutex
 	connections   map[*Connection]struct{}
@@ -105,11 +113,19 @@ func NewHandler(cfg Config, factory HubFactory) (*Handler, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
+	protocol, err := newProtocolConfig(cfg.Serialization, cfg.MaxPayloadSize)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.ReadLimit == 0 {
+		cfg.ReadLimit = HeaderSize + protocol.maxPayloadSize
+	}
 
 	return &Handler{
 		cfg:           cfg,
 		factory:       factory,
 		logger:        cfg.Logger,
+		protocol:      protocol,
 		connections:   make(map[*Connection]struct{}),
 		userConnIndex: make(map[string]map[*Connection]struct{}),
 	}, nil
@@ -157,8 +173,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn := newConnection(connectionID, userID, r, ws)
-	if h.cfg.ReadLimit > 0 {
+	conn := newConnection(connectionID, userID, r, ws, h.protocol)
+	if h.cfg.ReadLimit != 0 {
 		ws.SetReadLimit(h.cfg.ReadLimit)
 	}
 
@@ -203,7 +219,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		slog.String("remote_addr", remoteAddr(conn)),
 	)
 
-	err = h.readLoop(conn)
+	err = h.readLoop(conn, hub)
 	hub.OnDisconnected(conn.ctx, conn, err)
 	h.logger.Info("websocket connection closed",
 		slog.String("connection_id", conn.ID),
@@ -308,11 +324,27 @@ func (h *Handler) closeActive(_ websocket.StatusCode, _ string) {
 	}
 }
 
-func (h *Handler) readLoop(conn *Connection) error {
+func (h *Handler) readLoop(conn *Connection, hub Hub) error {
+	messageHub, receivesMessages := hub.(MessageHub)
 	for {
-		_, _, err := conn.ws.Read(conn.ctx)
+		typ, frame, err := conn.ws.Read(conn.ctx)
 		if err != nil {
 			return err
+		}
+		if typ != websocket.MessageBinary {
+			err = ErrInvalidMessageType
+			_ = conn.CloseWithStatus(websocket.StatusUnsupportedData, err.Error())
+			return err
+		}
+		msg, err := h.protocol.decodeFrame(frame)
+		if err != nil {
+			_ = conn.CloseWithStatus(websocket.StatusProtocolError, "invalid signalg protocol frame")
+			return err
+		}
+		if receivesMessages {
+			if err = messageHub.OnMessage(conn.ctx, conn, msg); err != nil {
+				return err
+			}
 		}
 	}
 }
