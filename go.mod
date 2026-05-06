@@ -5,6 +5,7 @@ go 1.26
 require (
 	github.com/cloudwego/hertz v0.10.4
 	github.com/coder/websocket v1.8.14
+	github.com/kanengo/ku v0.0.0-20260506150511-c00d6785e002
 	github.com/matoous/go-nanoid/v2 v2.1.0
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	google.golang.org/protobuf v1.34.1
@@ -18,7 +19,6 @@ require (
 	github.com/cloudwego/gopkg v0.1.4 // indirect
 	github.com/cloudwego/netpoll v0.7.2 // indirect
 	github.com/fsnotify/fsnotify v1.5.4 // indirect
-	github.com/kanengo/ku v0.0.0-20260506150511-c00d6785e002 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.9 // indirect
 	github.com/tidwall/gjson v1.14.4 // indirect
 	github.com/tidwall/match v1.1.1 // indirect

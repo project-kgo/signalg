@@ -12,15 +12,7 @@ import (
 	"github.com/kanengo/ku/poolx/slicepool"
 )
 
-const maxPooledFrameSize = HeaderSize + 4<<20
-
 var emptyFrameHeader [HeaderSize]byte
-
-// var frameBufferPool = sync.Pool{
-// 	New: func() any {
-// 		return make([]byte, 0, HeaderSize+1024)
-// 	},
-// }
 
 var frameBufferPool = &slicepool.Pool[byte]{}
 
@@ -93,56 +85,68 @@ func (c *Connection) Serialization() Serialization {
 }
 
 // Send encodes body with the connection codec and writes one SignalG binary frame.
-func (c *Connection) Send(ctx context.Context, msgType MessageType, body any) error {
+func (c *Connection) Send(ctx context.Context, method string, body any) error {
 	if c == nil || c.ws == nil {
 		return errors.New("signalg: nil websocket connection")
 	}
 	if c.protocol == nil {
 		return ErrUnsupportedCodec
 	}
+	if err := validateMethodName(method); err != nil {
+		return err
+	}
 
-	frame := getFrameBuffer(HeaderSize)
+	frame := getFrameBuffer(HeaderSize + len(method))
 	defer putFrameBuffer(frame)
 
 	frame = append(frame, emptyFrameHeader[:]...)
+	frame = append(frame, method...)
 	var err error
 	frame, err = c.protocol.marshalAppend(frame, body)
 	if err != nil {
 		return err
 	}
-	return c.writeFrame(ctx, msgType, frame)
+	return c.writeFrame(ctx, method, frame)
 }
 
 // SendRaw writes one SignalG binary frame with an already-encoded payload.
-func (c *Connection) SendRaw(ctx context.Context, msgType MessageType, payload []byte) error {
+func (c *Connection) SendRaw(ctx context.Context, method string, payload []byte) error {
 	if c == nil || c.ws == nil {
 		return errors.New("signalg: nil websocket connection")
 	}
 	if c.protocol == nil {
 		return ErrUnsupportedCodec
 	}
+	if err := validateMethodName(method); err != nil {
+		return err
+	}
 
-	frame := getFrameBuffer(HeaderSize + len(payload))
+	frame := getFrameBuffer(HeaderSize + len(method) + len(payload))
 	defer putFrameBuffer(frame)
 
 	frame = append(frame, emptyFrameHeader[:]...)
+	frame = append(frame, method...)
 	frame = append(frame, payload...)
-	return c.writeFrame(ctx, msgType, frame)
+	return c.writeFrame(ctx, method, frame)
 }
 
-func (c *Connection) writeFrame(ctx context.Context, msgType MessageType, frame []byte) error {
-	if len(frame) < HeaderSize {
+func (c *Connection) writeFrame(ctx context.Context, method string, frame []byte) error {
+	if err := validateMethodName(method); err != nil {
+		return err
+	}
+	methodLen := len(method)
+	if len(frame) < HeaderSize+methodLen {
 		return fmt.Errorf("%w: frame shorter than header", ErrInvalidFrame)
 	}
-	payloadLen := len(frame) - HeaderSize
-	if err := c.protocol.ensurePayloadSize(payloadLen); err != nil {
+	bodyLen := len(frame) - HeaderSize - methodLen
+	if err := c.protocol.ensurePayloadSize(bodyLen); err != nil {
 		return err
 	}
 	encodeFrameHeader(frame[:HeaderSize], FrameHeader{
-		Version:     protocolVersion,
-		Codec:       c.protocol.serialization(),
-		MessageType: msgType,
-		BodyLen:     uint32(payloadLen),
+		Version:   protocolVersion,
+		Codec:     c.protocol.serialization(),
+		MethodLen: uint8(methodLen),
+		BodyLen:   uint32(bodyLen),
 	})
 	return c.ws.Write(ctx, websocket.MessageBinary, frame)
 }

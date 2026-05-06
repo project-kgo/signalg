@@ -40,8 +40,8 @@ func TestNewHandlerValidationAndDefaults(t *testing.T) {
 	if handler.protocol.maxPayloadSize != DefaultMaxPayloadSize {
 		t.Fatalf("expected default max payload %d, got %d", DefaultMaxPayloadSize, handler.protocol.maxPayloadSize)
 	}
-	if handler.cfg.ReadLimit != HeaderSize+DefaultMaxPayloadSize {
-		t.Fatalf("expected default read limit %d, got %d", HeaderSize+DefaultMaxPayloadSize, handler.cfg.ReadLimit)
+	if handler.cfg.ReadLimit != HeaderSize+MaxMethodNameLen+DefaultMaxPayloadSize {
+		t.Fatalf("expected default read limit %d, got %d", HeaderSize+MaxMethodNameLen+DefaultMaxPayloadSize, handler.cfg.ReadLimit)
 	}
 
 	handler, err = NewHandler(Config{Path: "custom"}, func(*Connection) (Hub, error) {
@@ -161,7 +161,7 @@ func TestConnectionSendWritesProtocolFrame(t *testing.T) {
 	defer client.CloseNow()
 
 	conn := receiveConnection(t, connected)
-	if err := conn.Send(context.Background(), 11, protocolTestBody{Name: "server", Seq: 3}); err != nil {
+	if err := conn.Send(context.Background(), "server.send", protocolTestBody{Name: "server", Seq: 3}); err != nil {
 		t.Fatalf("Send returned error: %v", err)
 	}
 
@@ -176,8 +176,8 @@ func TestConnectionSendWritesProtocolFrame(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decodeFrame returned error: %v", err)
 	}
-	if msg.Type != 11 {
-		t.Fatalf("expected message type 11, got %d", msg.Type)
+	if msg.Method != "server.send" {
+		t.Fatalf("expected method server.send, got %q", msg.Method)
 	}
 	var got protocolTestBody
 	if err = msg.Decode(&got); err != nil {
@@ -199,15 +199,15 @@ func TestMessageHubReceivesProtocolMessage(t *testing.T) {
 	client := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
 	defer client.CloseNow()
 
-	frame := encodeTestFrame(t, handler.protocol.codec, 12, protocolTestBody{Name: "client", Seq: 4})
+	frame := encodeTestFrame(t, handler.protocol.codec, "client.send", protocolTestBody{Name: "client", Seq: 4})
 	if err := client.Write(context.Background(), websocket.MessageBinary, frame); err != nil {
 		t.Fatalf("client write: %v", err)
 	}
 
 	select {
 	case msg := <-messages:
-		if msg.Type != 12 {
-			t.Fatalf("expected message type 12, got %d", msg.Type)
+		if msg.Method != "client.send" {
+			t.Fatalf("expected method client.send, got %q", msg.Method)
 		}
 		var got protocolTestBody
 		if err := msg.Decode(&got); err != nil {
@@ -242,7 +242,7 @@ func TestConnectionSendConcurrent(t *testing.T) {
 		i := i
 		go func() {
 			defer wg.Done()
-			errs <- conn.SendRaw(context.Background(), MessageType(100+i), []byte{byte(i)})
+			errs <- conn.SendRaw(context.Background(), "method."+string(rune('a'+i)), []byte{byte(i)})
 		}()
 	}
 	wg.Wait()
@@ -253,7 +253,7 @@ func TestConnectionSendConcurrent(t *testing.T) {
 		}
 	}
 
-	seen := make(map[MessageType]struct{}, sends)
+	seen := make(map[string]struct{}, sends)
 	for i := 0; i < sends; i++ {
 		typ, frame, err := client.Read(context.Background())
 		if err != nil {
@@ -266,12 +266,12 @@ func TestConnectionSendConcurrent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("decodeFrame returned error: %v", err)
 		}
-		seen[msg.Type] = struct{}{}
+		seen[msg.Method] = struct{}{}
 	}
 	for i := 0; i < sends; i++ {
-		msgType := MessageType(100 + i)
-		if _, ok := seen[msgType]; !ok {
-			t.Fatalf("missing sent message type %d", msgType)
+		method := "method." + string(rune('a'+i))
+		if _, ok := seen[method]; !ok {
+			t.Fatalf("missing sent method %s", method)
 		}
 	}
 }

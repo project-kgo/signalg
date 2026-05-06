@@ -118,7 +118,7 @@ func NewHandler(cfg Config, factory HubFactory) (*Handler, error) {
 		return nil, err
 	}
 	if cfg.ReadLimit == 0 {
-		cfg.ReadLimit = HeaderSize + protocol.maxPayloadSize
+		cfg.ReadLimit = HeaderSize + MaxMethodNameLen + protocol.maxPayloadSize
 	}
 
 	return &Handler{

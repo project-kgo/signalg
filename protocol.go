@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"unicode/utf8"
 
 	"github.com/vmihailenco/msgpack/v5"
 	"google.golang.org/protobuf/proto"
@@ -13,13 +14,15 @@ import (
 
 const (
 	// HeaderSize is the byte length of one SignalG protocol frame header.
-	HeaderSize = 16
+	HeaderSize = 8
+
+	// MaxMethodNameLen is the max byte length of a SignalG method name.
+	MaxMethodNameLen = 255
 
 	// DefaultMaxPayloadSize is the default max body size for one SignalG message.
 	DefaultMaxPayloadSize int64 = 1 << 20
 
-	protocolMagic0  byte = 'S'
-	protocolMagic1  byte = 'G'
+	protocolMagic   byte = 'S'
 	protocolVersion byte = 1
 )
 
@@ -30,6 +33,7 @@ var (
 	ErrPayloadTooLarge      = errors.New("signalg: protocol payload too large")
 	ErrInvalidMessageType   = errors.New("signalg: websocket message must be binary")
 	ErrUnsupportedBodyValue = errors.New("signalg: unsupported body value")
+	ErrInvalidMethodName    = errors.New("signalg: invalid method name")
 )
 
 // Serialization identifies the body codec used by SignalG protocol frames.
@@ -57,23 +61,19 @@ func (s Serialization) String() string {
 	}
 }
 
-// MessageType is an application-defined message kind carried in the fixed header.
-type MessageType uint16
-
 // FrameHeader is the fixed SignalG protocol frame header.
 type FrameHeader struct {
-	Version     uint8
-	Codec       Serialization
-	MessageType MessageType
-	Flags       uint16
-	BodyLen     uint32
-	Reserved    uint32
+	Magic     byte
+	Version   uint8
+	Codec     Serialization
+	MethodLen uint8
+	BodyLen   uint32
 }
 
 // Message is a validated SignalG protocol frame.
 type Message struct {
 	Header  FrameHeader
-	Type    MessageType
+	Method  string
 	Payload []byte
 
 	codec BodyCodec
@@ -159,14 +159,11 @@ func normalizeMaxPayloadSize(n int64) int64 {
 }
 
 func encodeFrameHeader(dst []byte, header FrameHeader) {
-	dst[0] = protocolMagic0
-	dst[1] = protocolMagic1
-	dst[2] = protocolVersion
-	dst[3] = byte(header.Codec)
-	binary.BigEndian.PutUint16(dst[4:6], uint16(header.MessageType))
-	binary.BigEndian.PutUint16(dst[6:8], header.Flags)
-	binary.BigEndian.PutUint32(dst[8:12], header.BodyLen)
-	binary.BigEndian.PutUint32(dst[12:16], header.Reserved)
+	dst[0] = protocolMagic
+	dst[1] = protocolVersion
+	dst[2] = byte(header.Codec)
+	dst[3] = header.MethodLen
+	binary.BigEndian.PutUint32(dst[4:8], header.BodyLen)
 }
 
 func decodeFrame(frame []byte, codec BodyCodec, maxPayloadSize int64) (Message, error) {
@@ -174,47 +171,62 @@ func decodeFrame(frame []byte, codec BodyCodec, maxPayloadSize int64) (Message, 
 	if len(frame) < HeaderSize {
 		return Message{}, fmt.Errorf("%w: frame shorter than header", ErrInvalidFrame)
 	}
-	if frame[0] != protocolMagic0 || frame[1] != protocolMagic1 {
+	if frame[0] != protocolMagic {
 		return Message{}, fmt.Errorf("%w: bad magic", ErrInvalidFrame)
 	}
-	if frame[2] != protocolVersion {
-		return Message{}, fmt.Errorf("%w: unsupported version %d", ErrInvalidFrame, frame[2])
+	if frame[1] != protocolVersion {
+		return Message{}, fmt.Errorf("%w: unsupported version %d", ErrInvalidFrame, frame[1])
 	}
 	if codec == nil {
 		return Message{}, ErrUnsupportedCodec
 	}
 
 	header := FrameHeader{
-		Version:     frame[2],
-		Codec:       Serialization(frame[3]),
-		MessageType: MessageType(binary.BigEndian.Uint16(frame[4:6])),
-		Flags:       binary.BigEndian.Uint16(frame[6:8]),
-		BodyLen:     binary.BigEndian.Uint32(frame[8:12]),
-		Reserved:    binary.BigEndian.Uint32(frame[12:16]),
+		Magic:     frame[0],
+		Version:   frame[1],
+		Codec:     Serialization(frame[2]),
+		MethodLen: frame[3],
+		BodyLen:   binary.BigEndian.Uint32(frame[4:8]),
 	}
 	if header.Codec != codec.Serialization() {
 		return Message{}, fmt.Errorf("%w: got %s, want %s", ErrUnexpectedCodec, header.Codec, codec.Serialization())
 	}
-	if header.Flags != 0 {
-		return Message{}, fmt.Errorf("%w: flags must be zero", ErrInvalidFrame)
-	}
-	if header.Reserved != 0 {
-		return Message{}, fmt.Errorf("%w: reserved must be zero", ErrInvalidFrame)
+	if header.MethodLen == 0 {
+		return Message{}, fmt.Errorf("%w: method name is empty", ErrInvalidMethodName)
 	}
 	if int64(header.BodyLen) > maxPayloadSize {
 		return Message{}, fmt.Errorf("%w: %d > %d", ErrPayloadTooLarge, header.BodyLen, maxPayloadSize)
 	}
-	wantLen := HeaderSize + int(header.BodyLen)
+	wantLen := HeaderSize + int(header.MethodLen) + int(header.BodyLen)
 	if len(frame) != wantLen {
 		return Message{}, fmt.Errorf("%w: length mismatch got %d want %d", ErrInvalidFrame, len(frame), wantLen)
+	}
+	methodStart := HeaderSize
+	methodEnd := methodStart + int(header.MethodLen)
+	methodBytes := frame[methodStart:methodEnd]
+	if !utf8.Valid(methodBytes) {
+		return Message{}, fmt.Errorf("%w: method name must be utf-8", ErrInvalidMethodName)
 	}
 
 	return Message{
 		Header:  header,
-		Type:    header.MessageType,
-		Payload: frame[HeaderSize:],
+		Method:  string(methodBytes),
+		Payload: frame[methodEnd:],
 		codec:   codec,
 	}, nil
+}
+
+func validateMethodName(method string) error {
+	if method == "" {
+		return fmt.Errorf("%w: method name is empty", ErrInvalidMethodName)
+	}
+	if len(method) > MaxMethodNameLen {
+		return fmt.Errorf("%w: method name length %d > %d", ErrInvalidMethodName, len(method), MaxMethodNameLen)
+	}
+	if !utf8.ValidString(method) {
+		return fmt.Errorf("%w: method name must be utf-8", ErrInvalidMethodName)
+	}
+	return nil
 }
 
 type messagePackCodec struct{}
