@@ -352,7 +352,7 @@ func (h *Handler) readLoop(conn *Connection, hub Hub) error {
 			b := bpool.Get()
 			defer bpool.Put(b)
 
-			_, err := b.ReadFrom(rd)
+			_, err = b.ReadFrom(rd)
 			if err != nil {
 				return err
 			}
