@@ -208,10 +208,13 @@ func decodeFrame(frame []byte, codec BodyCodec, maxPayloadSize int64) (Message, 
 		return Message{}, fmt.Errorf("%w: method name must be utf-8", ErrInvalidMethodName)
 	}
 
+	payload := make([]byte, int(header.BodyLen))
+	copy(payload, frame[methodEnd:])
+
 	return Message{
 		Header:  header,
 		Method:  string(methodBytes),
-		Payload: frame[methodEnd:],
+		Payload: payload,
 		codec:   codec,
 	}, nil
 }

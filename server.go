@@ -14,6 +14,7 @@ import (
 
 	"github.com/coder/websocket"
 	gonanoid "github.com/matoous/go-nanoid/v2"
+	"github.com/project-kgo/signalg/internal/bpool"
 )
 
 const (
@@ -327,24 +328,42 @@ func (h *Handler) closeActive(_ websocket.StatusCode, _ string) {
 func (h *Handler) readLoop(conn *Connection, hub Hub) error {
 	messageHub, receivesMessages := hub.(MessageHub)
 	for {
-		typ, frame, err := conn.ws.Read(conn.ctx)
+		typ, rd, err := conn.ws.Reader(conn.ctx)
 		if err != nil {
 			return err
 		}
+
 		if typ != websocket.MessageBinary {
 			err = ErrInvalidMessageType
 			_ = conn.CloseWithStatus(websocket.StatusUnsupportedData, err.Error())
 			return err
 		}
-		msg, err := h.protocol.decodeFrame(frame)
-		if err != nil {
-			_ = conn.CloseWithStatus(websocket.StatusProtocolError, "invalid signalg protocol frame")
-			return err
-		}
-		if receivesMessages {
-			if err = messageHub.OnMessage(conn.ctx, conn, msg); err != nil {
+
+		err = func() error {
+			b := bpool.Get()
+			defer bpool.Put(b)
+
+			_, err := b.ReadFrom(rd)
+			if err != nil {
 				return err
 			}
+
+			frame := b.Bytes()
+
+			msg, err := h.protocol.decodeFrame(frame)
+			if err != nil {
+				_ = conn.CloseWithStatus(websocket.StatusProtocolError, "invalid signalg protocol frame")
+				return err
+			}
+			if receivesMessages {
+				if err = messageHub.OnMessage(conn.ctx, conn, msg); err != nil {
+					return err
+				}
+			}
+			return nil
+		}()
+		if err != nil {
+			return err
 		}
 	}
 }
