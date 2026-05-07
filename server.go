@@ -87,6 +87,8 @@ type Handler struct {
 	active        sync.WaitGroup
 	shuttingDown  atomic.Bool
 	online        atomic.Int64
+	shutdownOnce  sync.Once
+	shutdownErr   error
 }
 
 type drainingConnection struct {
@@ -305,7 +307,13 @@ func (h *Handler) Shutdown(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	h.shutdownOnce.Do(func() {
+		h.shutdownErr = h.shutdown(ctx)
+	})
+	return h.shutdownErr
+}
 
+func (h *Handler) shutdown(ctx context.Context) error {
 	drainingConnections := h.beginShutdown()
 	if err := h.waitConnectionsDrained(ctx, drainingConnections); err != nil {
 		h.closeDrainingConnections(drainingConnections)

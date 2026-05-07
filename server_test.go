@@ -812,6 +812,35 @@ func TestHandlerShutdownWaitsForInFlightMessageAndSend(t *testing.T) {
 	}
 }
 
+func TestHandlerShutdownOnlyRunsOnce(t *testing.T) {
+	connected := make(chan *Connection, 1)
+	disconnected := make(chan error, 1)
+	handler := newTestHandler(t, Config{}, func(*Connection) (Hub, error) {
+		return &recordingHub{
+			connected:    connected,
+			disconnected: disconnected,
+		}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client.CloseNow()
+	receiveConnection(t, connected)
+
+	if err := handler.Shutdown(context.Background()); err != nil {
+		t.Fatalf("first Shutdown returned error: %v", err)
+	}
+	receiveDisconnect(t, disconnected)
+
+	if err := handler.Shutdown(context.Background()); err != nil {
+		t.Fatalf("second Shutdown returned error: %v", err)
+	}
+	if got := handler.Online(); got != 0 {
+		t.Fatalf("expected zero online connections, got %d", got)
+	}
+}
+
 func TestServerShutdownClosesListenerWhenDrainTimesOut(t *testing.T) {
 	started := make(chan struct{})
 	cfg := ServerConfig{
