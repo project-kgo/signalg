@@ -744,6 +744,123 @@ func TestServerShutdownStopsServingAndClosesActiveConnections(t *testing.T) {
 	}
 }
 
+func TestHandlerShutdownWaitsForInFlightMessageAndSend(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handler := newTestHandler(t, Config{}, func(*Connection) (Hub, error) {
+		return &drainMessageHub{
+			started: started,
+			release: release,
+		}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client.CloseNow()
+
+	frame := encodeTestFrame(t, handler.protocol.codec, "client.send", protocolTestBody{Name: "client", Seq: 1})
+	if err := client.Write(context.Background(), websocket.MessageBinary, frame); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for message handler")
+	}
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		shutdownDone <- handler.Shutdown(ctx)
+	}()
+
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("Shutdown returned before in-flight handler finished: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	typ, frame, err := client.Read(ctx)
+	if err != nil {
+		t.Fatalf("client read: %v", err)
+	}
+	if typ != websocket.MessageBinary {
+		t.Fatalf("expected binary message, got %s", typ)
+	}
+	msg, err := handler.protocol.decodeFrame(frame)
+	if err != nil {
+		t.Fatalf("decodeFrame returned error: %v", err)
+	}
+	if msg.Method != "server.done" {
+		t.Fatalf("expected method server.done, got %q", msg.Method)
+	}
+
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("Shutdown returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for shutdown")
+	}
+}
+
+func TestServerShutdownClosesListenerWhenDrainTimesOut(t *testing.T) {
+	started := make(chan struct{})
+	cfg := ServerConfig{
+		Addr:   freeAddr(t),
+		Config: Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))},
+	}
+	server, err := NewServer(cfg, func(*Connection) (Hub, error) {
+		return &recordingMessageHub{
+			onMessage: func(ctx context.Context, _ *Connection, _ Message) error {
+				close(started)
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("NewServer returned error: %v", err)
+	}
+	if err := server.Start(); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+
+	client := dialWebSocket(t, "ws://"+server.cfg.Addr+DefaultPath, nil)
+	defer client.CloseNow()
+
+	frame := encodeTestFrame(t, server.handler.protocol.codec, "client.send", protocolTestBody{Name: "client", Seq: 1})
+	if err := client.Write(context.Background(), websocket.MessageBinary, frame); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for message handler")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := server.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got %v", err)
+	}
+
+	conn, err := net.DialTimeout("tcp", server.cfg.Addr, 100*time.Millisecond)
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("expected listener to be closed after shutdown timeout")
+	}
+}
+
 type recordingHub struct {
 	onConnected  func(context.Context, *Connection) error
 	connected    chan *Connection
@@ -819,6 +936,22 @@ func (h *recordingMessageHub) OnMessage(ctx context.Context, conn *Connection, m
 		h.messages <- msg
 	}
 	return nil
+}
+
+type drainMessageHub struct {
+	recordingHub
+	started chan<- struct{}
+	release <-chan struct{}
+}
+
+func (h *drainMessageHub) OnMessage(ctx context.Context, conn *Connection, _ Message) error {
+	if h.started != nil {
+		close(h.started)
+	}
+	if h.release != nil {
+		<-h.release
+	}
+	return conn.Send(ctx, "server.done", protocolTestBody{Name: "server", Seq: 2})
 }
 
 type priorityMessageHub struct {

@@ -28,10 +28,18 @@ type Connection struct {
 	ws         *websocket.Conn
 	remoteAddr net.Addr
 	protocol   *protocolConfig
+
+	opsMu          sync.Mutex
+	activeOps      int
+	activeHandlers int
+	draining       bool
+	opsDone        chan struct{}
 }
 
 func newConnection(id, userID string, request *http.Request, ws *websocket.Conn, protocol *protocolConfig) *Connection {
 	ctx, cancel := context.WithCancel(context.Background())
+	opsDone := make(chan struct{})
+	close(opsDone)
 	conn := &Connection{
 		ID:       id,
 		UserID:   userID,
@@ -39,6 +47,7 @@ func newConnection(id, userID string, request *http.Request, ws *websocket.Conn,
 		cancel:   cancel,
 		ws:       ws,
 		protocol: protocol,
+		opsDone:  opsDone,
 	}
 	if request != nil {
 		conn.Request = request.Clone(ctx)
@@ -92,6 +101,10 @@ func (c *Connection) Send(ctx context.Context, method string, body any) error {
 	if c.protocol == nil {
 		return ErrUnsupportedCodec
 	}
+	if !c.beginSendOperation() {
+		return ErrHandlerShuttingDown
+	}
+	defer c.endOperation()
 	return c.writeEncodedProtocolFrame(ctx, FrameKindMessage, method, "", body)
 }
 
@@ -103,6 +116,10 @@ func (c *Connection) SendRaw(ctx context.Context, method string, payload []byte)
 	if c.protocol == nil {
 		return ErrUnsupportedCodec
 	}
+	if !c.beginSendOperation() {
+		return ErrHandlerShuttingDown
+	}
+	defer c.endOperation()
 	return c.writeRawProtocolFrame(ctx, FrameKindMessage, method, "", payload)
 }
 
@@ -114,6 +131,10 @@ func (c *Connection) Complete(ctx context.Context, invocationID string, body any
 	if c.protocol == nil {
 		return ErrUnsupportedCodec
 	}
+	if !c.beginSendOperation() {
+		return ErrHandlerShuttingDown
+	}
+	defer c.endOperation()
 	return c.writeEncodedProtocolFrame(ctx, FrameKindCompletion, "", invocationID, body)
 }
 
@@ -125,6 +146,10 @@ func (c *Connection) CompleteError(ctx context.Context, invocationID string, err
 	if c.protocol == nil {
 		return ErrUnsupportedCodec
 	}
+	if !c.beginSendOperation() {
+		return ErrHandlerShuttingDown
+	}
+	defer c.endOperation()
 	if err == nil {
 		err = errors.New("signalg: invocation failed")
 	}
@@ -136,7 +161,7 @@ func (c *Connection) writeEncodedProtocolFrame(ctx context.Context, kind FrameKi
 		return err
 	}
 
-	frame := getFrameBuffer(HeaderSize + len(method) + len(invocationID))
+	frame := getFrameBuffer(HeaderSize + len(method) + len(invocationID) + 4096)
 	defer putFrameBuffer(frame)
 
 	frame = append(frame, emptyFrameHeader[:]...)
@@ -226,6 +251,85 @@ func (c *Connection) closeNow() error {
 		return nil
 	}
 	return c.ws.CloseNow()
+}
+
+func (c *Connection) beginHandlerOperation() bool {
+	if c == nil {
+		return false
+	}
+	c.opsMu.Lock()
+	defer c.opsMu.Unlock()
+	if c.draining {
+		return false
+	}
+	c.beginOperationLocked()
+	c.activeHandlers++
+	return true
+}
+
+func (c *Connection) endHandlerOperation() {
+	if c == nil {
+		return
+	}
+	c.opsMu.Lock()
+	if c.activeHandlers > 0 {
+		c.activeHandlers--
+	}
+	c.endOperationLocked()
+	c.opsMu.Unlock()
+}
+
+func (c *Connection) beginSendOperation() bool {
+	if c == nil {
+		return false
+	}
+	c.opsMu.Lock()
+	defer c.opsMu.Unlock()
+	if c.draining && c.activeHandlers == 0 {
+		return false
+	}
+	c.beginOperationLocked()
+	return true
+}
+
+func (c *Connection) endOperation() {
+	if c == nil {
+		return
+	}
+	c.opsMu.Lock()
+	c.endOperationLocked()
+	c.opsMu.Unlock()
+}
+
+func (c *Connection) beginDrain() <-chan struct{} {
+	if c == nil {
+		done := make(chan struct{})
+		close(done)
+		return done
+	}
+	c.opsMu.Lock()
+	c.draining = true
+	done := c.opsDone
+	c.opsMu.Unlock()
+
+	return done
+}
+
+func (c *Connection) beginOperationLocked() {
+	if c.activeOps == 0 {
+		c.opsDone = make(chan struct{})
+	}
+	c.activeOps++
+}
+
+func (c *Connection) endOperationLocked() {
+	if c.activeOps == 0 {
+		return
+	}
+	c.activeOps--
+	if c.activeOps == 0 {
+		close(c.opsDone)
+	}
 }
 
 func parseRemoteAddr(addr string) net.Addr {

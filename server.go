@@ -24,9 +24,10 @@ const (
 )
 
 var (
-	ErrMissingAddr   = errors.New("signalg: server addr is required")
-	ErrNilHubFactory = errors.New("signalg: hub factory is required")
-	ErrNilHub        = errors.New("signalg: hub factory returned nil hub")
+	ErrMissingAddr         = errors.New("signalg: server addr is required")
+	ErrNilHubFactory       = errors.New("signalg: hub factory is required")
+	ErrNilHub              = errors.New("signalg: hub factory returned nil hub")
+	ErrHandlerShuttingDown = errors.New("signalg: handler is shutting down")
 )
 
 // Hub handles lifecycle events for one websocket connection.
@@ -83,7 +84,14 @@ type Handler struct {
 	mu            sync.RWMutex
 	connections   map[*Connection]struct{}
 	userConnIndex map[string]map[*Connection]struct{}
+	active        sync.WaitGroup
+	shuttingDown  atomic.Bool
 	online        atomic.Int64
+}
+
+type drainingConnection struct {
+	conn *Connection
+	done <-chan struct{}
 }
 
 // ServerConfig configures a standalone SignalG websocket server.
@@ -137,6 +145,10 @@ func NewHandler(cfg Config, factory HubFactory) (*Handler, error) {
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL == nil || r.URL.Path != h.cfg.Path {
 		http.NotFound(w, r)
+		return
+	}
+	if h.shuttingDown.Load() {
+		http.Error(w, ErrHandlerShuttingDown.Error(), http.StatusServiceUnavailable)
 		return
 	}
 	if h.cfg.CheckOrigin != nil && !h.cfg.CheckOrigin(r) {
@@ -201,16 +213,37 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.addConnection(conn)
-	defer h.removeConnection(conn)
+	if !h.addConnection(conn) {
+		_ = ws.CloseNow()
+		conn.closeContext()
+		return
+	}
+	removed := false
+	removeConnection := func() {
+		if removed {
+			return
+		}
+		removed = true
+		h.removeConnection(conn)
+	}
+	defer h.finishConnection()
+	defer removeConnection()
 	defer conn.closeContext()
 
-	if err = hub.OnConnected(conn.ctx, conn); err != nil {
+	err = h.runHandlerOperation(conn, func() error {
+		return hub.OnConnected(conn.ctx, conn)
+	})
+	if err != nil {
+		if errors.Is(err, ErrHandlerShuttingDown) {
+			_ = ws.CloseNow()
+			return
+		}
 		h.logger.Error("hub connected callback failed",
 			slog.String("connection_id", conn.ID),
 			slog.String("remote_addr", remoteAddr(conn)),
 			slog.Any("error", err),
 		)
+		removeConnection()
 		hub.OnDisconnected(conn.ctx, conn, err)
 		_ = ws.CloseNow()
 		return
@@ -222,6 +255,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 
 	err = h.readLoop(conn, hub)
+	removeConnection()
 	hub.OnDisconnected(conn.ctx, conn, err)
 	h.logger.Info("websocket connection closed",
 		slog.String("connection_id", conn.ID),
@@ -262,6 +296,37 @@ func (h *Handler) UserConnections(userID string) []*Connection {
 	return connections
 }
 
+// Shutdown drains this handler by rejecting new websocket upgrades, closing all
+// active websocket connections, and waiting until their handlers return.
+func (h *Handler) Shutdown(ctx context.Context) error {
+	if h == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	drainingConnections := h.beginShutdown()
+	if err := h.waitConnectionsDrained(ctx, drainingConnections); err != nil {
+		h.closeDrainingConnections(drainingConnections)
+		return err
+	}
+	h.closeDrainingConnections(drainingConnections)
+
+	done := make(chan struct{})
+	go func() {
+		h.active.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (h *Handler) acceptOptions() *websocket.AcceptOptions {
 	opts := &websocket.AcceptOptions{
 		Subprotocols:         h.cfg.Subprotocols,
@@ -284,8 +349,13 @@ func (h *Handler) resolveUserID(r *http.Request) (string, error) {
 	return h.cfg.UserProvider.GetUserID(r)
 }
 
-func (h *Handler) addConnection(conn *Connection) {
+func (h *Handler) addConnection(conn *Connection) bool {
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.shuttingDown.Load() {
+		return false
+	}
+	h.active.Add(1)
 	h.connections[conn] = struct{}{}
 	if conn.UserID != "" {
 		userConnections := h.userConnIndex[conn.UserID]
@@ -295,12 +365,17 @@ func (h *Handler) addConnection(conn *Connection) {
 		}
 		userConnections[conn] = struct{}{}
 	}
-	h.mu.Unlock()
 	h.online.Add(1)
+	return true
 }
 
 func (h *Handler) removeConnection(conn *Connection) {
 	h.mu.Lock()
+	_, ok := h.connections[conn]
+	if !ok {
+		h.mu.Unlock()
+		return
+	}
 	delete(h.connections, conn)
 	if conn.UserID != "" {
 		userConnections := h.userConnIndex[conn.UserID]
@@ -313,17 +388,64 @@ func (h *Handler) removeConnection(conn *Connection) {
 	h.online.Add(-1)
 }
 
-func (h *Handler) closeActive(_ websocket.StatusCode, _ string) {
-	h.mu.RLock()
-	connections := make([]*Connection, 0, len(h.connections))
-	for conn := range h.connections {
-		connections = append(connections, conn)
-	}
-	h.mu.RUnlock()
+func (h *Handler) finishConnection() {
+	h.active.Done()
+}
 
-	for _, conn := range connections {
-		_ = conn.closeNow()
+func (h *Handler) beginShutdown() []drainingConnection {
+	h.mu.Lock()
+	h.shuttingDown.Store(true)
+	connections := make([]drainingConnection, 0, len(h.connections))
+	for conn := range h.connections {
+		connections = append(connections, drainingConnection{
+			conn: conn,
+			done: conn.beginDrain(),
+		})
 	}
+	h.mu.Unlock()
+	return connections
+}
+
+func (h *Handler) waitConnectionsDrained(ctx context.Context, connections []drainingConnection) error {
+	if len(connections) == 0 {
+		return nil
+	}
+	var wg sync.WaitGroup
+	wg.Add(len(connections))
+	for _, draining := range connections {
+		go func(done <-chan struct{}) {
+			defer wg.Done()
+			<-done
+		}(draining.done)
+	}
+
+	drained := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(drained)
+	}()
+
+	select {
+	case <-drained:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (h *Handler) closeDrainingConnections(connections []drainingConnection) {
+	for _, draining := range connections {
+		draining.conn.closeContext()
+		_ = draining.conn.closeNow()
+	}
+}
+
+func (h *Handler) runHandlerOperation(conn *Connection, fn func() error) error {
+	if !conn.beginHandlerOperation() {
+		return ErrHandlerShuttingDown
+	}
+	defer conn.endHandlerOperation()
+	return fn()
 }
 
 func (h *Handler) readLoop(conn *Connection, hub Hub) error {
@@ -365,13 +487,13 @@ func (h *Handler) readLoop(conn *Connection, hub Hub) error {
 				return err
 			}
 			if receivesMessages {
-				if err = messageHub.OnMessage(conn.ctx, conn, msg); err != nil {
-					return err
-				}
-			} else if err = h.dispatchMessage(conn, hub, dispatcher, msg); err != nil {
-				return err
+				return h.runHandlerOperation(conn, func() error {
+					return messageHub.OnMessage(conn.ctx, conn, msg)
+				})
 			}
-			return nil
+			return h.runHandlerOperation(conn, func() error {
+				return h.dispatchMessage(conn, hub, dispatcher, msg)
+			})
 		}()
 		if err != nil {
 			return err
@@ -461,16 +583,27 @@ func (s *Server) Start() error {
 
 // Shutdown gracefully stops the HTTP server and active websocket connections.
 func (s *Server) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.shutdownOnce.Do(func() {
 		s.handler.logger.Info("shutting down signalg websocket server",
 			slog.String("addr", s.cfg.Addr),
 		)
-		s.handler.closeActive(websocket.StatusGoingAway, "server shutdown")
-		if err := s.server.Shutdown(ctx); err != nil {
-			s.shutdownErr = err
-			s.handler.logger.Error("failed to shut down signalg websocket server",
+
+		serverDone := make(chan error, 1)
+		go func() {
+			serverDone <- s.server.Shutdown(ctx)
+		}()
+
+		handlerErr := s.handler.Shutdown(ctx)
+		serverErr := <-serverDone
+		if handlerErr != nil || serverErr != nil {
+			s.shutdownErr = errors.Join(handlerErr, serverErr)
+			s.handler.logger.Error("failed to drain signalg websocket handler",
 				slog.String("addr", s.cfg.Addr),
-				slog.Any("error", err),
+				slog.Any("handler_error", handlerErr),
+				slog.Any("server_error", serverErr),
 			)
 			return
 		}

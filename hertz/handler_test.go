@@ -64,8 +64,63 @@ func TestHandlerWorksWithHertzRoute(t *testing.T) {
 	}
 }
 
+func TestManagedHandlerShutdownDrainsHertzConnections(t *testing.T) {
+	connected := make(chan *signalg.Connection, 1)
+	disconnected := make(chan error, 1)
+	addr := freeAddr(t)
+
+	handler, err := NewHandler(signalg.Config{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}, func(*signalg.Connection) (signalg.Hub, error) {
+		return &recordingHub{
+			connected:    connected,
+			disconnected: disconnected,
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("NewHandler returned error: %v", err)
+	}
+
+	h := hertzserver.New(
+		hertzserver.WithHostPorts(addr),
+		hertzserver.WithExitWaitTime(2*time.Second),
+	)
+	h.GET(signalg.DefaultPath, handler.Handle)
+	h.OnShutdown = append(h.OnShutdown, func(ctx context.Context) {
+		_ = handler.Shutdown(ctx)
+	})
+
+	go h.Spin()
+	waitTCP(t, addr)
+
+	client := dialWebSocket(t, "ws://"+addr+signalg.DefaultPath)
+	defer client.CloseNow()
+
+	select {
+	case <-connected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for connection")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := h.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown returned error: %v", err)
+	}
+
+	select {
+	case <-disconnected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for disconnect")
+	}
+	if handler.SignalGHandler().Online() != 0 {
+		t.Fatalf("expected zero online connections, got %d", handler.SignalGHandler().Online())
+	}
+}
+
 type recordingHub struct {
-	connected chan *signalg.Connection
+	connected    chan *signalg.Connection
+	disconnected chan error
 }
 
 func (h *recordingHub) OnConnected(_ context.Context, conn *signalg.Connection) error {
@@ -75,7 +130,11 @@ func (h *recordingHub) OnConnected(_ context.Context, conn *signalg.Connection) 
 	return nil
 }
 
-func (h *recordingHub) OnDisconnected(context.Context, *signalg.Connection, error) {}
+func (h *recordingHub) OnDisconnected(_ context.Context, _ *signalg.Connection, err error) {
+	if h.disconnected != nil {
+		h.disconnected <- err
+	}
+}
 
 func freeAddr(t *testing.T) string {
 	t.Helper()
