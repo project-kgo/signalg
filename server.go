@@ -3,6 +3,7 @@ package signalg
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -119,7 +120,7 @@ func NewHandler(cfg Config, factory HubFactory) (*Handler, error) {
 		return nil, err
 	}
 	if cfg.ReadLimit == 0 {
-		cfg.ReadLimit = HeaderSize + MaxMethodNameLen + protocol.maxPayloadSize
+		cfg.ReadLimit = HeaderSize + MaxMethodNameLen + MaxInvocationIDLen + protocol.maxPayloadSize
 	}
 
 	return &Handler{
@@ -327,6 +328,14 @@ func (h *Handler) closeActive(_ websocket.StatusCode, _ string) {
 
 func (h *Handler) readLoop(conn *Connection, hub Hub) error {
 	messageHub, receivesMessages := hub.(MessageHub)
+	var dispatcher *hubDispatcher
+	if !receivesMessages {
+		var err error
+		dispatcher, err = dispatcherFor(hub)
+		if err != nil {
+			return err
+		}
+	}
 	for {
 		typ, rd, err := conn.ws.Reader(conn.ctx)
 		if err != nil {
@@ -359,12 +368,30 @@ func (h *Handler) readLoop(conn *Connection, hub Hub) error {
 				if err = messageHub.OnMessage(conn.ctx, conn, msg); err != nil {
 					return err
 				}
+			} else if err = h.dispatchMessage(conn, hub, dispatcher, msg); err != nil {
+				return err
 			}
 			return nil
 		}()
 		if err != nil {
 			return err
 		}
+	}
+}
+
+func (h *Handler) dispatchMessage(conn *Connection, hub Hub, dispatcher *hubDispatcher, msg Message) error {
+	switch msg.Kind {
+	case FrameKindMessage:
+		_, err := dispatcher.dispatch(conn.ctx, hub, msg)
+		return err
+	case FrameKindInvoke:
+		res, err := dispatcher.dispatch(conn.ctx, hub, msg)
+		if err != nil {
+			return conn.CompleteError(conn.ctx, msg.InvocationID, err)
+		}
+		return conn.Complete(conn.ctx, msg.InvocationID, res)
+	default:
+		return fmt.Errorf("%w: %s", ErrInvalidFrameKind, msg.Kind)
 	}
 }
 

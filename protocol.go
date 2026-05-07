@@ -19,10 +19,13 @@ const (
 	// MaxMethodNameLen is the max byte length of a SignalG method name.
 	MaxMethodNameLen = 255
 
+	// MaxInvocationIDLen is the max byte length of a SignalG invocation id.
+	MaxInvocationIDLen = 255
+
 	// DefaultMaxPayloadSize is the default max body size for one SignalG message.
 	DefaultMaxPayloadSize int64 = 1 << 20
 
-	protocolMagic   byte = 'S'
+	protocolMagic   byte = 0x5
 	protocolVersion byte = 1
 )
 
@@ -34,6 +37,8 @@ var (
 	ErrInvalidMessageType   = errors.New("signalg: websocket message must be binary")
 	ErrUnsupportedBodyValue = errors.New("signalg: unsupported body value")
 	ErrInvalidMethodName    = errors.New("signalg: invalid method name")
+	ErrInvalidInvocationID  = errors.New("signalg: invalid invocation id")
+	ErrInvalidFrameKind     = errors.New("signalg: invalid frame kind")
 )
 
 // Serialization identifies the body codec used by SignalG protocol frames.
@@ -61,20 +66,53 @@ func (s Serialization) String() string {
 	}
 }
 
+// FrameKind identifies the semantic kind of a SignalG protocol frame.
+type FrameKind uint8
+
+const (
+	// FrameKindMessage is a fire-and-forget message.
+	FrameKindMessage FrameKind = iota
+	// FrameKindInvoke is a client-to-server invocation that expects a completion.
+	FrameKindInvoke
+	// FrameKindCompletion is a successful invocation result.
+	FrameKindCompletion
+	// FrameKindError is a failed invocation result.
+	FrameKindError
+)
+
+func (k FrameKind) String() string {
+	switch k {
+	case FrameKindMessage:
+		return "message"
+	case FrameKindInvoke:
+		return "invoke"
+	case FrameKindCompletion:
+		return "completion"
+	case FrameKindError:
+		return "error"
+	default:
+		return fmt.Sprintf("unknown(%d)", k)
+	}
+}
+
 // FrameHeader is the fixed SignalG protocol frame header.
 type FrameHeader struct {
-	Magic     byte
-	Version   uint8
-	Codec     Serialization
-	MethodLen uint8
-	BodyLen   uint32
+	Magic           byte
+	Version         uint8
+	Codec           Serialization
+	Kind            FrameKind
+	MethodLen       uint8
+	InvocationIDLen uint8
+	BodyLen         uint32
 }
 
 // Message is a validated SignalG protocol frame.
 type Message struct {
-	Header  FrameHeader
-	Method  string
-	Payload []byte
+	Header       FrameHeader
+	Kind         FrameKind
+	Method       string
+	InvocationID string
+	Payload      []byte
 
 	codec BodyCodec
 }
@@ -159,10 +197,10 @@ func normalizeMaxPayloadSize(n int64) int64 {
 }
 
 func encodeFrameHeader(dst []byte, header FrameHeader) {
-	dst[0] = protocolMagic
-	dst[1] = protocolVersion
-	dst[2] = byte(header.Codec)
-	dst[3] = header.MethodLen
+	dst[0] = protocolMagic<<4 | (protocolVersion & 0x0f)
+	dst[1] = byte(header.Codec)<<4 | (byte(header.Kind) & 0x0f)
+	dst[2] = header.MethodLen
+	dst[3] = header.InvocationIDLen
 	binary.BigEndian.PutUint32(dst[4:8], header.BodyLen)
 }
 
@@ -171,36 +209,48 @@ func decodeFrame(frame []byte, codec BodyCodec, maxPayloadSize int64) (Message, 
 	if len(frame) < HeaderSize {
 		return Message{}, fmt.Errorf("%w: frame shorter than header", ErrInvalidFrame)
 	}
-	if frame[0] != protocolMagic {
+	magic := frame[0] >> 4
+	version := frame[0] & 0x0f
+	if magic != protocolMagic {
 		return Message{}, fmt.Errorf("%w: bad magic", ErrInvalidFrame)
 	}
-	if frame[1] != protocolVersion {
-		return Message{}, fmt.Errorf("%w: unsupported version %d", ErrInvalidFrame, frame[1])
+	if version != protocolVersion {
+		return Message{}, fmt.Errorf("%w: unsupported version %d", ErrInvalidFrame, version)
 	}
 	if codec == nil {
 		return Message{}, ErrUnsupportedCodec
 	}
 
 	header := FrameHeader{
-		Magic:     frame[0],
-		Version:   frame[1],
-		Codec:     Serialization(frame[2]),
-		MethodLen: frame[3],
-		BodyLen:   binary.BigEndian.Uint32(frame[4:8]),
+		Magic:           magic,
+		Version:         version,
+		Codec:           Serialization(frame[1] >> 4),
+		Kind:            FrameKind(frame[1] & 0x0f),
+		MethodLen:       frame[2],
+		InvocationIDLen: frame[3],
+		BodyLen:         binary.BigEndian.Uint32(frame[4:8]),
 	}
 	if header.Codec != codec.Serialization() {
 		return Message{}, fmt.Errorf("%w: got %s, want %s", ErrUnexpectedCodec, header.Codec, codec.Serialization())
 	}
-	if header.MethodLen == 0 {
+	if err := validateFrameKind(header.Kind); err != nil {
+		return Message{}, err
+	}
+	if (header.Kind == FrameKindMessage || header.Kind == FrameKindInvoke) && header.MethodLen == 0 {
 		return Message{}, fmt.Errorf("%w: method name is empty", ErrInvalidMethodName)
+	}
+	if header.Kind != FrameKindMessage && header.InvocationIDLen == 0 {
+		return Message{}, fmt.Errorf("%w: invocation id is empty", ErrInvalidInvocationID)
 	}
 	if int64(header.BodyLen) > maxPayloadSize {
 		return Message{}, fmt.Errorf("%w: %d > %d", ErrPayloadTooLarge, header.BodyLen, maxPayloadSize)
 	}
-	wantLen := HeaderSize + int(header.MethodLen) + int(header.BodyLen)
+
+	wantLen := HeaderSize + int(header.MethodLen) + int(header.InvocationIDLen) + int(header.BodyLen)
 	if len(frame) != wantLen {
 		return Message{}, fmt.Errorf("%w: length mismatch got %d want %d", ErrInvalidFrame, len(frame), wantLen)
 	}
+
 	methodStart := HeaderSize
 	methodEnd := methodStart + int(header.MethodLen)
 	methodBytes := frame[methodStart:methodEnd]
@@ -208,14 +258,23 @@ func decodeFrame(frame []byte, codec BodyCodec, maxPayloadSize int64) (Message, 
 		return Message{}, fmt.Errorf("%w: method name must be utf-8", ErrInvalidMethodName)
 	}
 
+	invocationIDStart := methodEnd
+	invocationIDEnd := invocationIDStart + int(header.InvocationIDLen)
+	invocationIDBytes := frame[invocationIDStart:invocationIDEnd]
+	if !utf8.Valid(invocationIDBytes) {
+		return Message{}, fmt.Errorf("%w: invocation id must be utf-8", ErrInvalidInvocationID)
+	}
+
 	payload := make([]byte, int(header.BodyLen))
-	copy(payload, frame[methodEnd:])
+	copy(payload, frame[invocationIDEnd:])
 
 	return Message{
-		Header:  header,
-		Method:  string(methodBytes),
-		Payload: payload,
-		codec:   codec,
+		Header:       header,
+		Kind:         header.Kind,
+		Method:       string(methodBytes),
+		InvocationID: string(invocationIDBytes),
+		Payload:      payload,
+		codec:        codec,
 	}, nil
 }
 
@@ -230,6 +289,28 @@ func validateMethodName(method string) error {
 		return fmt.Errorf("%w: method name must be utf-8", ErrInvalidMethodName)
 	}
 	return nil
+}
+
+func validateInvocationID(invocationID string) error {
+	if invocationID == "" {
+		return fmt.Errorf("%w: invocation id is empty", ErrInvalidInvocationID)
+	}
+	if len(invocationID) > MaxInvocationIDLen {
+		return fmt.Errorf("%w: invocation id length %d > %d", ErrInvalidInvocationID, len(invocationID), MaxInvocationIDLen)
+	}
+	if !utf8.ValidString(invocationID) {
+		return fmt.Errorf("%w: invocation id must be utf-8", ErrInvalidInvocationID)
+	}
+	return nil
+}
+
+func validateFrameKind(kind FrameKind) error {
+	switch kind {
+	case FrameKindMessage, FrameKindInvoke, FrameKindCompletion, FrameKindError:
+		return nil
+	default:
+		return fmt.Errorf("%w: %s", ErrInvalidFrameKind, kind)
+	}
 }
 
 type messagePackCodec struct{}

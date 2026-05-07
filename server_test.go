@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 func TestNewHandlerValidationAndDefaults(t *testing.T) {
@@ -40,8 +41,9 @@ func TestNewHandlerValidationAndDefaults(t *testing.T) {
 	if handler.protocol.maxPayloadSize != DefaultMaxPayloadSize {
 		t.Fatalf("expected default max payload %d, got %d", DefaultMaxPayloadSize, handler.protocol.maxPayloadSize)
 	}
-	if handler.cfg.ReadLimit != HeaderSize+MaxMethodNameLen+DefaultMaxPayloadSize {
-		t.Fatalf("expected default read limit %d, got %d", HeaderSize+MaxMethodNameLen+DefaultMaxPayloadSize, handler.cfg.ReadLimit)
+	wantReadLimit := HeaderSize + MaxMethodNameLen + MaxInvocationIDLen + DefaultMaxPayloadSize
+	if handler.cfg.ReadLimit != wantReadLimit {
+		t.Fatalf("expected default read limit %d, got %d", wantReadLimit, handler.cfg.ReadLimit)
 	}
 
 	handler, err = NewHandler(Config{Path: "custom"}, func(*Connection) (Hub, error) {
@@ -218,6 +220,253 @@ func TestMessageHubReceivesProtocolMessage(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for protocol message")
+	}
+}
+
+func TestDefaultDispatcherDispatchesMatchingMethod(t *testing.T) {
+	codec := mustCodec(t, SerializationMessagePack)
+	hub := &reflectDispatchHub{}
+	dispatcher, err := dispatcherFor(hub)
+	if err != nil {
+		t.Fatalf("dispatcherFor returned error: %v", err)
+	}
+
+	frame := encodeTestFrame(t, codec, "Echo", protocolTestBody{Name: "client", Seq: 4})
+	msg, err := decodeFrame(frame, codec, DefaultMaxPayloadSize)
+	if err != nil {
+		t.Fatalf("decodeFrame returned error: %v", err)
+	}
+
+	res, err := dispatcher.dispatch(context.Background(), hub, msg)
+	if err != nil {
+		t.Fatalf("dispatch returned error: %v", err)
+	}
+	got, ok := res.(*protocolTestBody)
+	if !ok {
+		t.Fatalf("expected *protocolTestBody response, got %T", res)
+	}
+	if got.Name != "client:echo" || got.Seq != 5 {
+		t.Fatalf("unexpected response: %#v", got)
+	}
+}
+
+func TestDefaultDispatcherIgnoresInvalidSignatures(t *testing.T) {
+	dispatcher, err := dispatcherFor(&invalidSignatureHub{})
+	if err != nil {
+		t.Fatalf("dispatcherFor returned error: %v", err)
+	}
+	if len(dispatcher.routes) != 0 {
+		t.Fatalf("expected no registered routes, got %d", len(dispatcher.routes))
+	}
+}
+
+func TestMessageHubTakesPriorityOverDefaultDispatcher(t *testing.T) {
+	messages := make(chan Message, 1)
+	handler := newTestHandler(t, Config{}, func(*Connection) (Hub, error) {
+		return &priorityMessageHub{messages: messages}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client.CloseNow()
+
+	frame := encodeInvokeTestFrame(t, handler.protocol.codec, FrameKindInvoke, "Echo", "priority-1", protocolTestBody{Name: "client", Seq: 4})
+	if err := client.Write(context.Background(), websocket.MessageBinary, frame); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+
+	select {
+	case msg := <-messages:
+		if msg.Method != "Echo" || msg.InvocationID != "priority-1" {
+			t.Fatalf("unexpected message: %#v", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for protocol message")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, _, err := client.Read(ctx); err == nil {
+		t.Fatal("expected no default completion when MessageHub handles the message")
+	}
+}
+
+func TestDefaultDispatcherInvokeMessagePackCompletion(t *testing.T) {
+	connected := make(chan *Connection, 1)
+	handler := newTestHandler(t, Config{}, func(*Connection) (Hub, error) {
+		return &reflectDispatchHub{
+			recordingHub: recordingHub{connected: connected},
+		}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client.CloseNow()
+	receiveConnection(t, connected)
+
+	frame := encodeInvokeTestFrame(t, handler.protocol.codec, FrameKindInvoke, "Echo", "invoke-1", protocolTestBody{Name: "client", Seq: 7})
+	if err := client.Write(context.Background(), websocket.MessageBinary, frame); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+
+	msg := readProtocolMessage(t, handler, client)
+	if msg.Kind != FrameKindCompletion {
+		t.Fatalf("expected completion frame, got %s", msg.Kind)
+	}
+	if msg.InvocationID != "invoke-1" {
+		t.Fatalf("expected invocation id invoke-1, got %q", msg.InvocationID)
+	}
+	var got protocolTestBody
+	if err := msg.Decode(&got); err != nil {
+		t.Fatalf("Decode returned error: %v", err)
+	}
+	if got.Name != "client:echo" || got.Seq != 8 {
+		t.Fatalf("unexpected completion body: %#v", got)
+	}
+}
+
+func TestDefaultDispatcherInvokeJSONAndProtobuf(t *testing.T) {
+	t.Run("json", func(t *testing.T) {
+		handler := newTestHandler(t, Config{Serialization: SerializationJSON}, func(*Connection) (Hub, error) {
+			return &reflectDispatchHub{}, nil
+		})
+		server := httptest.NewServer(handler)
+		defer server.Close()
+
+		client := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+		defer client.CloseNow()
+
+		frame := encodeInvokeTestFrame(t, handler.protocol.codec, FrameKindInvoke, "Echo", "json-1", protocolTestBody{Name: "json", Seq: 1})
+		if err := client.Write(context.Background(), websocket.MessageBinary, frame); err != nil {
+			t.Fatalf("client write: %v", err)
+		}
+
+		msg := readProtocolMessage(t, handler, client)
+		if msg.Kind != FrameKindCompletion {
+			t.Fatalf("expected completion frame, got %s", msg.Kind)
+		}
+		var got protocolTestBody
+		if err := msg.Decode(&got); err != nil {
+			t.Fatalf("Decode returned error: %v", err)
+		}
+		if got.Name != "json:echo" || got.Seq != 2 {
+			t.Fatalf("unexpected completion body: %#v", got)
+		}
+	})
+
+	t.Run("protobuf", func(t *testing.T) {
+		handler := newTestHandler(t, Config{Serialization: SerializationProtobuf}, func(*Connection) (Hub, error) {
+			return &protobufDispatchHub{}, nil
+		})
+		server := httptest.NewServer(handler)
+		defer server.Close()
+
+		client := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+		defer client.CloseNow()
+
+		frame := encodeInvokeTestFrame(t, handler.protocol.codec, FrameKindInvoke, "EchoProto", "proto-1", wrapperspb.String("protobuf"))
+		if err := client.Write(context.Background(), websocket.MessageBinary, frame); err != nil {
+			t.Fatalf("client write: %v", err)
+		}
+
+		msg := readProtocolMessage(t, handler, client)
+		if msg.Kind != FrameKindCompletion {
+			t.Fatalf("expected completion frame, got %s", msg.Kind)
+		}
+		var got wrapperspb.StringValue
+		if err := msg.Decode(&got); err != nil {
+			t.Fatalf("Decode returned error: %v", err)
+		}
+		if got.Value != "protobuf:echo" {
+			t.Fatalf("unexpected completion body: %q", got.Value)
+		}
+	})
+}
+
+func TestDefaultDispatcherInvokeErrorKeepsConnectionOpen(t *testing.T) {
+	handler := newTestHandler(t, Config{}, func(*Connection) (Hub, error) {
+		return &reflectDispatchHub{}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client.CloseNow()
+
+	frame := encodeInvokeTestFrame(t, handler.protocol.codec, FrameKindInvoke, "Fail", "fail-1", protocolTestBody{Name: "client", Seq: 1})
+	if err := client.Write(context.Background(), websocket.MessageBinary, frame); err != nil {
+		t.Fatalf("client write fail invoke: %v", err)
+	}
+
+	msg := readProtocolMessage(t, handler, client)
+	if msg.Kind != FrameKindError {
+		t.Fatalf("expected error frame, got %s", msg.Kind)
+	}
+	if msg.InvocationID != "fail-1" {
+		t.Fatalf("expected invocation id fail-1, got %q", msg.InvocationID)
+	}
+	if string(msg.Payload) != "reflect failure" {
+		t.Fatalf("expected error payload reflect failure, got %q", msg.Payload)
+	}
+
+	frame = encodeInvokeTestFrame(t, handler.protocol.codec, FrameKindInvoke, "Echo", "ok-1", protocolTestBody{Name: "after", Seq: 2})
+	if err := client.Write(context.Background(), websocket.MessageBinary, frame); err != nil {
+		t.Fatalf("client write echo invoke: %v", err)
+	}
+	msg = readProtocolMessage(t, handler, client)
+	if msg.Kind != FrameKindCompletion {
+		t.Fatalf("expected completion after error, got %s", msg.Kind)
+	}
+	if msg.InvocationID != "ok-1" {
+		t.Fatalf("expected invocation id ok-1, got %q", msg.InvocationID)
+	}
+}
+
+func TestDefaultDispatcherUnknownInvokeReturnsError(t *testing.T) {
+	handler := newTestHandler(t, Config{}, func(*Connection) (Hub, error) {
+		return &reflectDispatchHub{}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client.CloseNow()
+
+	frame := encodeInvokeTestFrame(t, handler.protocol.codec, FrameKindInvoke, "Missing", "missing-1", protocolTestBody{Name: "client", Seq: 1})
+	if err := client.Write(context.Background(), websocket.MessageBinary, frame); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+
+	msg := readProtocolMessage(t, handler, client)
+	if msg.Kind != FrameKindError {
+		t.Fatalf("expected error frame, got %s", msg.Kind)
+	}
+	if msg.InvocationID != "missing-1" {
+		t.Fatalf("expected invocation id missing-1, got %q", msg.InvocationID)
+	}
+	if !strings.Contains(string(msg.Payload), ErrMethodNotFound.Error()) {
+		t.Fatalf("expected method not found payload, got %q", msg.Payload)
+	}
+}
+
+func TestDefaultDispatcherProtobufRejectsNonProtoRequest(t *testing.T) {
+	codec := mustCodec(t, SerializationProtobuf)
+	hub := &reflectDispatchHub{}
+	dispatcher, err := dispatcherFor(hub)
+	if err != nil {
+		t.Fatalf("dispatcherFor returned error: %v", err)
+	}
+	msg := Message{
+		Kind:    FrameKindMessage,
+		Method:  "Echo",
+		Payload: []byte{0x0a, 0x01, 'x'},
+		codec:   codec,
+	}
+	_, err = dispatcher.dispatch(context.Background(), hub, msg)
+	if !errors.Is(err, ErrUnsupportedBodyValue) {
+		t.Fatalf("expected ErrUnsupportedBodyValue, got %v", err)
 	}
 }
 
@@ -517,6 +766,45 @@ func (h *recordingHub) OnDisconnected(_ context.Context, _ *Connection, err erro
 	}
 }
 
+type reflectDispatchHub struct {
+	recordingHub
+}
+
+func (h *reflectDispatchHub) Echo(_ context.Context, req *protocolTestBody) (*protocolTestBody, error) {
+	return &protocolTestBody{
+		Name: req.Name + ":echo",
+		Seq:  req.Seq + 1,
+	}, nil
+}
+
+func (h *reflectDispatchHub) Fail(context.Context, *protocolTestBody) (*protocolTestBody, error) {
+	return nil, errors.New("reflect failure")
+}
+
+type protobufDispatchHub struct {
+	recordingHub
+}
+
+func (h *protobufDispatchHub) EchoProto(_ context.Context, req *wrapperspb.StringValue) (*wrapperspb.StringValue, error) {
+	return wrapperspb.String(req.Value + ":echo"), nil
+}
+
+type invalidSignatureHub struct {
+	recordingHub
+}
+
+func (h *invalidSignatureHub) ValueReq(context.Context, protocolTestBody) (*protocolTestBody, error) {
+	return nil, nil
+}
+
+func (h *invalidSignatureHub) MissingError(context.Context, *protocolTestBody) *protocolTestBody {
+	return nil
+}
+
+func (h *invalidSignatureHub) WrongContext(string, *protocolTestBody) (*protocolTestBody, error) {
+	return nil, nil
+}
+
 type recordingMessageHub struct {
 	recordingHub
 	messages  chan Message
@@ -530,6 +818,16 @@ func (h *recordingMessageHub) OnMessage(ctx context.Context, conn *Connection, m
 	if h.messages != nil {
 		h.messages <- msg
 	}
+	return nil
+}
+
+type priorityMessageHub struct {
+	reflectDispatchHub
+	messages chan Message
+}
+
+func (h *priorityMessageHub) OnMessage(_ context.Context, _ *Connection, msg Message) error {
+	h.messages <- msg
 	return nil
 }
 
@@ -561,6 +859,23 @@ func newTestServer(t *testing.T, cfg ServerConfig, factory HubFactory) *Server {
 		shutdownServer(t, server)
 	})
 	return server
+}
+
+func readProtocolMessage(t *testing.T, handler *Handler, client *websocket.Conn) Message {
+	t.Helper()
+
+	typ, frame, err := client.Read(context.Background())
+	if err != nil {
+		t.Fatalf("client read: %v", err)
+	}
+	if typ != websocket.MessageBinary {
+		t.Fatalf("expected binary message, got %s", typ)
+	}
+	msg, err := handler.protocol.decodeFrame(frame)
+	if err != nil {
+		t.Fatalf("decodeFrame returned error: %v", err)
+	}
+	return msg
 }
 
 func shutdownServer(t *testing.T, server *Server) {

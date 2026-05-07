@@ -92,21 +92,7 @@ func (c *Connection) Send(ctx context.Context, method string, body any) error {
 	if c.protocol == nil {
 		return ErrUnsupportedCodec
 	}
-	if err := validateMethodName(method); err != nil {
-		return err
-	}
-
-	frame := getFrameBuffer(HeaderSize + len(method))
-	defer putFrameBuffer(frame)
-
-	frame = append(frame, emptyFrameHeader[:]...)
-	frame = append(frame, method...)
-	var err error
-	frame, err = c.protocol.marshalAppend(frame, body)
-	if err != nil {
-		return err
-	}
-	return c.writeFrame(ctx, method, frame)
+	return c.writeEncodedProtocolFrame(ctx, FrameKindMessage, method, "", body)
 }
 
 // SendRaw writes one SignalG binary frame with an already-encoded payload.
@@ -117,36 +103,113 @@ func (c *Connection) SendRaw(ctx context.Context, method string, payload []byte)
 	if c.protocol == nil {
 		return ErrUnsupportedCodec
 	}
-	if err := validateMethodName(method); err != nil {
+	return c.writeRawProtocolFrame(ctx, FrameKindMessage, method, "", payload)
+}
+
+// Complete writes one successful invocation completion frame.
+func (c *Connection) Complete(ctx context.Context, invocationID string, body any) error {
+	if c == nil || c.ws == nil {
+		return errors.New("signalg: nil websocket connection")
+	}
+	if c.protocol == nil {
+		return ErrUnsupportedCodec
+	}
+	return c.writeEncodedProtocolFrame(ctx, FrameKindCompletion, "", invocationID, body)
+}
+
+// CompleteError writes one failed invocation completion frame.
+func (c *Connection) CompleteError(ctx context.Context, invocationID string, err error) error {
+	if c == nil || c.ws == nil {
+		return errors.New("signalg: nil websocket connection")
+	}
+	if c.protocol == nil {
+		return ErrUnsupportedCodec
+	}
+	if err == nil {
+		err = errors.New("signalg: invocation failed")
+	}
+	return c.writeRawProtocolFrame(ctx, FrameKindError, "", invocationID, []byte(err.Error()))
+}
+
+func (c *Connection) writeEncodedProtocolFrame(ctx context.Context, kind FrameKind, method, invocationID string, body any) error {
+	if err := validateProtocolFrame(kind, method, invocationID); err != nil {
 		return err
 	}
 
-	frame := getFrameBuffer(HeaderSize + len(method) + len(payload))
+	frame := getFrameBuffer(HeaderSize + len(method) + len(invocationID))
 	defer putFrameBuffer(frame)
 
 	frame = append(frame, emptyFrameHeader[:]...)
 	frame = append(frame, method...)
-	frame = append(frame, payload...)
-	return c.writeFrame(ctx, method, frame)
-}
+	frame = append(frame, invocationID...)
 
-func (c *Connection) writeFrame(ctx context.Context, method string, frame []byte) error {
-	if err := validateMethodName(method); err != nil {
+	var err error
+	frame, err = c.protocol.marshalAppend(frame, body)
+	if err != nil {
 		return err
 	}
-	methodLen := len(method)
-	if len(frame) < HeaderSize+methodLen {
+	return c.writePreparedProtocolFrame(ctx, kind, method, invocationID, frame)
+}
+
+func (c *Connection) writeRawProtocolFrame(ctx context.Context, kind FrameKind, method, invocationID string, payload []byte) error {
+	if err := validateProtocolFrame(kind, method, invocationID); err != nil {
+		return err
+	}
+	if err := c.protocol.ensurePayloadSize(len(payload)); err != nil {
+		return err
+	}
+
+	frame := getFrameBuffer(HeaderSize + len(method) + len(invocationID) + len(payload))
+	defer putFrameBuffer(frame)
+
+	frame = append(frame, emptyFrameHeader[:]...)
+	frame = append(frame, method...)
+	frame = append(frame, invocationID...)
+	frame = append(frame, payload...)
+	return c.writePreparedProtocolFrame(ctx, kind, method, invocationID, frame)
+}
+
+func validateProtocolFrame(kind FrameKind, method, invocationID string) error {
+	if err := validateFrameKind(kind); err != nil {
+		return err
+	}
+	if kind == FrameKindMessage || kind == FrameKindInvoke {
+		if err := validateMethodName(method); err != nil {
+			return err
+		}
+	} else if method != "" {
+		if err := validateMethodName(method); err != nil {
+			return err
+		}
+	}
+	if kind != FrameKindMessage {
+		if err := validateInvocationID(invocationID); err != nil {
+			return err
+		}
+	} else if invocationID != "" {
+		if err := validateInvocationID(invocationID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Connection) writePreparedProtocolFrame(ctx context.Context, kind FrameKind, method, invocationID string, frame []byte) error {
+	prefixLen := HeaderSize + len(method) + len(invocationID)
+	if len(frame) < prefixLen {
 		return fmt.Errorf("%w: frame shorter than header", ErrInvalidFrame)
 	}
-	bodyLen := len(frame) - HeaderSize - methodLen
+	bodyLen := len(frame) - prefixLen
 	if err := c.protocol.ensurePayloadSize(bodyLen); err != nil {
 		return err
 	}
 	encodeFrameHeader(frame[:HeaderSize], FrameHeader{
-		Version:   protocolVersion,
-		Codec:     c.protocol.serialization(),
-		MethodLen: uint8(methodLen),
-		BodyLen:   uint32(bodyLen),
+		Version:         protocolVersion,
+		Codec:           c.protocol.serialization(),
+		Kind:            kind,
+		MethodLen:       uint8(len(method)),
+		InvocationIDLen: uint8(len(invocationID)),
+		BodyLen:         uint32(bodyLen),
 	})
 	return c.ws.Write(ctx, websocket.MessageBinary, frame)
 }
