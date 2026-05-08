@@ -161,7 +161,7 @@ func (c *Connection) writeEncodedProtocolFrame(ctx context.Context, kind FrameKi
 		return err
 	}
 
-	frame := getFrameBuffer(HeaderSize + len(method) + len(invocationID) + 4096)
+	frame := getFrameBuffer(HeaderSize + len(method) + len(invocationID) + 512)
 	defer putFrameBuffer(frame)
 
 	frame = append(frame, emptyFrameHeader[:]...)

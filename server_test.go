@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -639,6 +640,215 @@ func TestHandlerUserConnectionIndex(t *testing.T) {
 	}
 }
 
+func TestHandlerSendAll(t *testing.T) {
+	connected := make(chan *Connection, 2)
+	handler := newTestHandler(t, Config{SendConcurrency: 1}, func(*Connection) (Hub, error) {
+		return &recordingHub{connected: connected}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client1 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client1.CloseNow()
+	client2 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client2.CloseNow()
+	receiveConnection(t, connected)
+	receiveConnection(t, connected)
+
+	result := handler.SendAll(context.Background(), "server.broadcast", protocolTestBody{Name: "all", Seq: 1})
+	assertSendResult(t, result, 2, 2, 0)
+	assertProtocolMessage(t, handler, client1, "server.broadcast", protocolTestBody{Name: "all", Seq: 1})
+	assertProtocolMessage(t, handler, client2, "server.broadcast", protocolTestBody{Name: "all", Seq: 1})
+}
+
+func TestHandlerSendUsersDeduplicatesConnections(t *testing.T) {
+	connected := make(chan *Connection, 3)
+	handler := newTestHandler(t, Config{
+		UserProvider: UserProviderFunc(func(r *http.Request) (string, error) {
+			return r.Header.Get("X-User-ID"), nil
+		}),
+	}, func(*Connection) (Hub, error) {
+		return &recordingHub{connected: connected}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client1 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, &websocket.DialOptions{
+		HTTPHeader: http.Header{"X-User-ID": []string{"user-1"}},
+	})
+	defer client1.CloseNow()
+	client2 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, &websocket.DialOptions{
+		HTTPHeader: http.Header{"X-User-ID": []string{"user-1"}},
+	})
+	defer client2.CloseNow()
+	client3 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, &websocket.DialOptions{
+		HTTPHeader: http.Header{"X-User-ID": []string{"user-2"}},
+	})
+	defer client3.CloseNow()
+	receiveConnection(t, connected)
+	receiveConnection(t, connected)
+	receiveConnection(t, connected)
+
+	result := handler.SendUsers(context.Background(), []string{"user-1", "user-2", "user-1", ""}, "server.users", protocolTestBody{Name: "users", Seq: 2})
+	assertSendResult(t, result, 3, 3, 0)
+	assertProtocolMessage(t, handler, client1, "server.users", protocolTestBody{Name: "users", Seq: 2})
+	assertProtocolMessage(t, handler, client2, "server.users", protocolTestBody{Name: "users", Seq: 2})
+	assertProtocolMessage(t, handler, client3, "server.users", protocolTestBody{Name: "users", Seq: 2})
+}
+
+func TestHandlerGroupIndexAndSendGroup(t *testing.T) {
+	connected := make(chan *Connection, 3)
+	disconnected := make(chan error, 3)
+	handler := newTestHandler(t, Config{}, func(*Connection) (Hub, error) {
+		return &recordingHub{
+			connected:    connected,
+			disconnected: disconnected,
+		}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client1 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client1.CloseNow()
+	client2 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client2.CloseNow()
+	client3 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client3.CloseNow()
+	conn1 := receiveConnection(t, connected)
+	conn2 := receiveConnection(t, connected)
+	conn3 := receiveConnection(t, connected)
+
+	if err := handler.AddToGroup(conn1, "room-1"); err != nil {
+		t.Fatalf("AddToGroup conn1 returned error: %v", err)
+	}
+	if err := handler.AddToGroup(conn2, "room-1"); err != nil {
+		t.Fatalf("AddToGroup conn2 returned error: %v", err)
+	}
+	if err := handler.AddToGroup(conn3, "room-2"); err != nil {
+		t.Fatalf("AddToGroup conn3 returned error: %v", err)
+	}
+	if got := handler.GroupOnline("room-1"); got != 2 {
+		t.Fatalf("expected room-1 online 2, got %d", got)
+	}
+	if got := handler.GroupOnline("missing"); got != 0 {
+		t.Fatalf("expected missing group online 0, got %d", got)
+	}
+
+	groupConnections := handler.GroupConnections("room-1")
+	if len(groupConnections) != 2 {
+		t.Fatalf("expected 2 room-1 connections, got %d", len(groupConnections))
+	}
+	assertContainsConnection(t, groupConnections, conn1)
+	assertContainsConnection(t, groupConnections, conn2)
+	groupConnections[0] = nil
+	if got := handler.GroupOnline("room-1"); got != 2 {
+		t.Fatalf("expected snapshot mutation not to affect group, got %d", got)
+	}
+
+	result := handler.SendGroup(context.Background(), "room-1", "server.group", protocolTestBody{Name: "room", Seq: 3})
+	assertSendResult(t, result, 2, 2, 0)
+	assertProtocolMessage(t, handler, client1, "server.group", protocolTestBody{Name: "room", Seq: 3})
+	assertProtocolMessage(t, handler, client2, "server.group", protocolTestBody{Name: "room", Seq: 3})
+
+	if err := handler.RemoveFromGroup(conn2, "room-1"); err != nil {
+		t.Fatalf("RemoveFromGroup returned error: %v", err)
+	}
+	if got := handler.GroupOnline("room-1"); got != 1 {
+		t.Fatalf("expected room-1 online 1, got %d", got)
+	}
+
+	handler.RemoveFromAllGroups(conn1)
+	if got := handler.GroupOnline("room-1"); got != 0 {
+		t.Fatalf("expected room-1 online 0 after RemoveFromAllGroups, got %d", got)
+	}
+
+	if err := client3.Close(websocket.StatusNormalClosure, "done"); err != nil {
+		t.Fatalf("close third client: %v", err)
+	}
+	receiveDisconnect(t, disconnected)
+	if got := handler.GroupOnline("room-2"); got != 0 {
+		t.Fatalf("expected room-2 online 0 after disconnect, got %d", got)
+	}
+}
+
+func TestHandlerGroupValidation(t *testing.T) {
+	handler := newTestHandler(t, Config{}, func(*Connection) (Hub, error) {
+		return &recordingHub{}, nil
+	})
+
+	if err := handler.AddToGroup(&Connection{ID: "missing"}, "room"); !errors.Is(err, ErrConnectionNotFound) {
+		t.Fatalf("expected ErrConnectionNotFound, got %v", err)
+	}
+	if err := handler.AddToGroup(nil, "room"); !errors.Is(err, ErrConnectionNotFound) {
+		t.Fatalf("expected ErrConnectionNotFound, got %v", err)
+	}
+	if err := handler.AddToGroup(&Connection{ID: "missing"}, " "); !errors.Is(err, ErrInvalidGroup) {
+		t.Fatalf("expected ErrInvalidGroup, got %v", err)
+	}
+	if result := handler.SendGroup(context.Background(), "", "server.group", protocolTestBody{}); !errors.Is(result.Err, ErrInvalidGroup) {
+		t.Fatalf("expected ErrInvalidGroup, got %v", result.Err)
+	}
+}
+
+func TestHandlerBatchSendErrors(t *testing.T) {
+	t.Run("invalid method", func(t *testing.T) {
+		handler := newTestHandler(t, Config{}, func(*Connection) (Hub, error) {
+			return &recordingHub{}, nil
+		})
+		result := handler.SendAll(context.Background(), "", protocolTestBody{})
+		if !errors.Is(result.Err, ErrInvalidMethodName) {
+			t.Fatalf("expected ErrInvalidMethodName, got %v", result.Err)
+		}
+	})
+
+	t.Run("encoding failure", func(t *testing.T) {
+		handler := newTestHandler(t, Config{Serialization: SerializationProtobuf}, func(*Connection) (Hub, error) {
+			return &recordingHub{}, nil
+		})
+		result := handler.SendAll(context.Background(), "server.bad", protocolTestBody{})
+		if !errors.Is(result.Err, ErrUnsupportedBodyValue) {
+			t.Fatalf("expected ErrUnsupportedBodyValue, got %v", result.Err)
+		}
+	})
+
+	t.Run("after shutdown", func(t *testing.T) {
+		handler := newTestHandler(t, Config{}, func(*Connection) (Hub, error) {
+			return &recordingHub{}, nil
+		})
+		if err := handler.Shutdown(context.Background()); err != nil {
+			t.Fatalf("Shutdown returned error: %v", err)
+		}
+		result := handler.SendAll(context.Background(), "server.done", protocolTestBody{})
+		if !errors.Is(result.Err, ErrHandlerShuttingDown) {
+			t.Fatalf("expected ErrHandlerShuttingDown, got %v", result.Err)
+		}
+	})
+
+	t.Run("partial failure", func(t *testing.T) {
+		connected := make(chan *Connection, 1)
+		handler := newTestHandler(t, Config{}, func(*Connection) (Hub, error) {
+			return &recordingHub{connected: connected}, nil
+		})
+		server := httptest.NewServer(handler)
+		defer server.Close()
+
+		client := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+		defer client.CloseNow()
+		conn := receiveConnection(t, connected)
+
+		payload, err := handler.prepareBatchPayload("server.partial", protocolTestBody{Name: "partial", Seq: 4})
+		if err != nil {
+			t.Fatalf("prepareBatchPayload returned error: %v", err)
+		}
+		result := handler.sendConnections(context.Background(), []*Connection{conn, &Connection{ID: "broken"}}, "server.partial", payload)
+		assertSendResult(t, result, 2, 1, 1)
+		if result.Err == nil {
+			t.Fatal("expected aggregate send error")
+		}
+		assertProtocolMessage(t, handler, client, "server.partial", protocolTestBody{Name: "partial", Seq: 4})
+	})
+}
+
 func TestHandlerRejectsUnexpectedPath(t *testing.T) {
 	handler := newTestHandler(t, Config{}, func(*Connection) (Hub, error) {
 		return &recordingHub{}, nil
@@ -1040,6 +1250,37 @@ func readProtocolMessage(t *testing.T, handler *Handler, client *websocket.Conn)
 	return msg
 }
 
+func assertProtocolMessage(t *testing.T, handler *Handler, client *websocket.Conn, method string, want protocolTestBody) {
+	t.Helper()
+
+	msg := readProtocolMessage(t, handler, client)
+	if msg.Method != method {
+		t.Fatalf("expected method %s, got %q", method, msg.Method)
+	}
+	var got protocolTestBody
+	if err := msg.Decode(&got); err != nil {
+		t.Fatalf("Decode returned error: %v", err)
+	}
+	if got != want {
+		t.Fatalf("unexpected decoded body: got %#v want %#v", got, want)
+	}
+}
+
+func assertSendResult(t *testing.T, result SendResult, matched, sent, failed int) {
+	t.Helper()
+
+	if result.Matched != matched || result.Sent != sent || result.Failed != failed {
+		t.Fatalf("unexpected send result: got matched=%d sent=%d failed=%d err=%v, want matched=%d sent=%d failed=%d",
+			result.Matched, result.Sent, result.Failed, result.Err, matched, sent, failed)
+	}
+	if failed == 0 && result.Err != nil {
+		t.Fatalf("expected nil send error, got %v", result.Err)
+	}
+	if failed > 0 && result.Err == nil {
+		t.Fatal("expected send error")
+	}
+}
+
 func shutdownServer(t *testing.T, server *Server) {
 	t.Helper()
 
@@ -1114,4 +1355,58 @@ func assertContainsConnection(t *testing.T, connections []*Connection, want *Con
 
 func httpToWS(url string) string {
 	return "ws" + strings.TrimPrefix(url, "http")
+}
+
+func BenchmarkConnectionRegistrySnapshots50K(b *testing.B) {
+	const total = 50000
+
+	registry := newConnectionRegistry()
+	for i := 0; i < total; i++ {
+		conn := &Connection{
+			ID:     "conn-" + strconv.Itoa(i),
+			UserID: "user-" + strconv.Itoa(i%1000),
+		}
+		registry.add(conn)
+		if i%10 == 0 {
+			if err := registry.addToGroup(conn, "group-hot"); err != nil {
+				b.Fatalf("addToGroup returned error: %v", err)
+			}
+		}
+	}
+
+	b.Run("users", func(b *testing.B) {
+		connections := registry.userSnapshot([]string{"user-1", "user-2", "user-1"})
+		if len(connections) != 100 {
+			b.Fatalf("expected 100 user connections, got %d", len(connections))
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = registry.userSnapshot([]string{"user-1", "user-2", "user-1"})
+		}
+	})
+
+	b.Run("group", func(b *testing.B) {
+		connections := registry.groupConnections("group-hot")
+		if len(connections) != 5000 {
+			b.Fatalf("expected 5000 group connections, got %d", len(connections))
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = registry.groupConnections("group-hot")
+		}
+	})
+
+	b.Run("all", func(b *testing.B) {
+		connections := registry.allConnections()
+		if len(connections) != total {
+			b.Fatalf("expected %d connections, got %d", total, len(connections))
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = registry.allConnections()
+		}
+	})
 }

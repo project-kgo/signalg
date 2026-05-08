@@ -21,6 +21,10 @@ import (
 const (
 	// DefaultPath is the default websocket endpoint path.
 	DefaultPath = "/signalg"
+
+	// DefaultSendConcurrency is the default max concurrent connection writes
+	// for Handler batch send APIs.
+	DefaultSendConcurrency = 256
 )
 
 var (
@@ -28,6 +32,8 @@ var (
 	ErrNilHubFactory       = errors.New("signalg: hub factory is required")
 	ErrNilHub              = errors.New("signalg: hub factory returned nil hub")
 	ErrHandlerShuttingDown = errors.New("signalg: handler is shutting down")
+	ErrConnectionNotFound  = errors.New("signalg: connection is not managed by handler")
+	ErrInvalidGroup        = errors.New("signalg: invalid group")
 )
 
 // Hub handles lifecycle events for one websocket connection.
@@ -72,6 +78,7 @@ type Config struct {
 	ReadLimit            int64
 	Serialization        Serialization
 	MaxPayloadSize       int64
+	SendConcurrency      int
 }
 
 // Handler accepts websocket requests and dispatches lifecycle events to hubs.
@@ -81,14 +88,21 @@ type Handler struct {
 	logger   *slog.Logger
 	protocol *protocolConfig
 
-	mu            sync.RWMutex
-	connections   map[*Connection]struct{}
-	userConnIndex map[string]map[*Connection]struct{}
-	active        sync.WaitGroup
-	shuttingDown  atomic.Bool
-	online        atomic.Int64
-	shutdownOnce  sync.Once
-	shutdownErr   error
+	registry        *connectionRegistry
+	sendConcurrency int
+	active          sync.WaitGroup
+	shuttingDown    atomic.Bool
+	online          atomic.Int64
+	shutdownOnce    sync.Once
+	shutdownErr     error
+}
+
+// SendResult describes a batch send operation outcome.
+type SendResult struct {
+	Matched int
+	Sent    int
+	Failed  int
+	Err     error
 }
 
 type drainingConnection struct {
@@ -132,14 +146,15 @@ func NewHandler(cfg Config, factory HubFactory) (*Handler, error) {
 	if cfg.ReadLimit == 0 {
 		cfg.ReadLimit = HeaderSize + MaxMethodNameLen + MaxInvocationIDLen + protocol.maxPayloadSize
 	}
+	sendConcurrency := normalizeSendConcurrency(cfg.SendConcurrency)
 
 	return &Handler{
-		cfg:           cfg,
-		factory:       factory,
-		logger:        cfg.Logger,
-		protocol:      protocol,
-		connections:   make(map[*Connection]struct{}),
-		userConnIndex: make(map[string]map[*Connection]struct{}),
+		cfg:             cfg,
+		factory:         factory,
+		logger:          cfg.Logger,
+		protocol:        protocol,
+		registry:        newConnectionRegistry(),
+		sendConcurrency: sendConcurrency,
 	}, nil
 }
 
@@ -273,29 +288,115 @@ func (h *Handler) Online() int {
 
 // UserOnline returns the current active websocket connection count for a user.
 func (h *Handler) UserOnline(userID string) int {
-	if userID == "" {
+	if h == nil || userID == "" {
 		return 0
 	}
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return len(h.userConnIndex[userID])
+	return h.registry.userOnline(userID)
 }
 
 // UserConnections returns a snapshot of active websocket connections for a user.
 func (h *Handler) UserConnections(userID string) []*Connection {
-	if userID == "" {
+	if h == nil || userID == "" {
 		return nil
 	}
+	return h.registry.userConnections(userID)
+}
 
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	userConnections := h.userConnIndex[userID]
-	connections := make([]*Connection, 0, len(userConnections))
-	for conn := range userConnections {
-		connections = append(connections, conn)
+// SendUsers sends one message to every active connection for the provided users.
+func (h *Handler) SendUsers(ctx context.Context, userIDs []string, method string, body any) SendResult {
+	if h == nil {
+		return SendResult{}
 	}
-	return connections
+	payload, err := h.prepareBatchPayload(method, body)
+	if err != nil {
+		return SendResult{Err: err}
+	}
+	if h.shuttingDown.Load() {
+		return SendResult{Err: ErrHandlerShuttingDown}
+	}
+	return h.sendConnections(ctx, h.registry.userSnapshot(userIDs), method, payload)
+}
+
+// SendGroup sends one message to every active connection in group.
+func (h *Handler) SendGroup(ctx context.Context, group string, method string, body any) SendResult {
+	if h == nil {
+		return SendResult{}
+	}
+	group = normalizeGroup(group)
+	if group == "" {
+		return SendResult{Err: ErrInvalidGroup}
+	}
+	payload, err := h.prepareBatchPayload(method, body)
+	if err != nil {
+		return SendResult{Err: err}
+	}
+	if h.shuttingDown.Load() {
+		return SendResult{Err: ErrHandlerShuttingDown}
+	}
+	return h.sendConnections(ctx, h.registry.groupConnections(group), method, payload)
+}
+
+// SendAll sends one message to every active connection.
+func (h *Handler) SendAll(ctx context.Context, method string, body any) SendResult {
+	if h == nil {
+		return SendResult{}
+	}
+	payload, err := h.prepareBatchPayload(method, body)
+	if err != nil {
+		return SendResult{Err: err}
+	}
+	if h.shuttingDown.Load() {
+		return SendResult{Err: ErrHandlerShuttingDown}
+	}
+	return h.sendConnections(ctx, h.registry.allConnections(), method, payload)
+}
+
+// AddToGroup adds conn to group.
+func (h *Handler) AddToGroup(conn *Connection, group string) error {
+	if h == nil {
+		return ErrConnectionNotFound
+	}
+	return h.registry.addToGroup(conn, group)
+}
+
+// RemoveFromGroup removes conn from group.
+func (h *Handler) RemoveFromGroup(conn *Connection, group string) error {
+	if h == nil {
+		return ErrConnectionNotFound
+	}
+	return h.registry.removeFromGroup(conn, group)
+}
+
+// RemoveFromAllGroups removes conn from every group.
+func (h *Handler) RemoveFromAllGroups(conn *Connection) {
+	if h == nil {
+		return
+	}
+	h.registry.removeFromAllGroups(conn)
+}
+
+// GroupOnline returns the current active websocket connection count for a group.
+func (h *Handler) GroupOnline(group string) int {
+	if h == nil {
+		return 0
+	}
+	group = normalizeGroup(group)
+	if group == "" {
+		return 0
+	}
+	return h.registry.groupOnline(group)
+}
+
+// GroupConnections returns a snapshot of active websocket connections in a group.
+func (h *Handler) GroupConnections(group string) []*Connection {
+	if h == nil {
+		return nil
+	}
+	group = normalizeGroup(group)
+	if group == "" {
+		return nil
+	}
+	return h.registry.groupConnections(group)
 }
 
 // Shutdown drains this handler by rejecting new websocket upgrades, closing all
@@ -358,41 +459,22 @@ func (h *Handler) resolveUserID(r *http.Request) (string, error) {
 }
 
 func (h *Handler) addConnection(conn *Connection) bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.registry.mu.Lock()
 	if h.shuttingDown.Load() {
+		h.registry.mu.Unlock()
 		return false
 	}
 	h.active.Add(1)
-	h.connections[conn] = struct{}{}
-	if conn.UserID != "" {
-		userConnections := h.userConnIndex[conn.UserID]
-		if userConnections == nil {
-			userConnections = make(map[*Connection]struct{})
-			h.userConnIndex[conn.UserID] = userConnections
-		}
-		userConnections[conn] = struct{}{}
-	}
+	h.registry.addLocked(conn)
+	h.registry.mu.Unlock()
 	h.online.Add(1)
 	return true
 }
 
 func (h *Handler) removeConnection(conn *Connection) {
-	h.mu.Lock()
-	_, ok := h.connections[conn]
-	if !ok {
-		h.mu.Unlock()
+	if !h.registry.remove(conn) {
 		return
 	}
-	delete(h.connections, conn)
-	if conn.UserID != "" {
-		userConnections := h.userConnIndex[conn.UserID]
-		delete(userConnections, conn)
-		if len(userConnections) == 0 {
-			delete(h.userConnIndex, conn.UserID)
-		}
-	}
-	h.mu.Unlock()
 	h.online.Add(-1)
 }
 
@@ -401,16 +483,18 @@ func (h *Handler) finishConnection() {
 }
 
 func (h *Handler) beginShutdown() []drainingConnection {
-	h.mu.Lock()
+	h.registry.mu.Lock()
 	h.shuttingDown.Store(true)
-	connections := make([]drainingConnection, 0, len(h.connections))
-	for conn := range h.connections {
+	snapshot := h.registry.allConnectionsLocked()
+	h.registry.mu.Unlock()
+
+	connections := make([]drainingConnection, 0, len(snapshot))
+	for _, conn := range snapshot {
 		connections = append(connections, drainingConnection{
 			conn: conn,
 			done: conn.beginDrain(),
 		})
 	}
-	h.mu.Unlock()
 	return connections
 }
 
@@ -635,6 +719,46 @@ func (s *Server) UserOnline(userID string) int {
 // UserConnections returns a snapshot of active websocket connections for a user.
 func (s *Server) UserConnections(userID string) []*Connection {
 	return s.handler.UserConnections(userID)
+}
+
+// SendUsers sends one message to every active connection for the provided users.
+func (s *Server) SendUsers(ctx context.Context, userIDs []string, method string, body any) SendResult {
+	return s.handler.SendUsers(ctx, userIDs, method, body)
+}
+
+// SendGroup sends one message to every active connection in group.
+func (s *Server) SendGroup(ctx context.Context, group string, method string, body any) SendResult {
+	return s.handler.SendGroup(ctx, group, method, body)
+}
+
+// SendAll sends one message to every active connection.
+func (s *Server) SendAll(ctx context.Context, method string, body any) SendResult {
+	return s.handler.SendAll(ctx, method, body)
+}
+
+// AddToGroup adds conn to group.
+func (s *Server) AddToGroup(conn *Connection, group string) error {
+	return s.handler.AddToGroup(conn, group)
+}
+
+// RemoveFromGroup removes conn from group.
+func (s *Server) RemoveFromGroup(conn *Connection, group string) error {
+	return s.handler.RemoveFromGroup(conn, group)
+}
+
+// RemoveFromAllGroups removes conn from every group.
+func (s *Server) RemoveFromAllGroups(conn *Connection) {
+	s.handler.RemoveFromAllGroups(conn)
+}
+
+// GroupOnline returns the current active websocket connection count for a group.
+func (s *Server) GroupOnline(group string) int {
+	return s.handler.GroupOnline(group)
+}
+
+// GroupConnections returns a snapshot of active websocket connections in a group.
+func (s *Server) GroupConnections(group string) []*Connection {
+	return s.handler.GroupConnections(group)
 }
 
 func normalizePath(p string) string {
