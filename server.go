@@ -252,8 +252,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer removeConnection()
 	defer conn.closeContext()
 
-	if err = h.sendConnected(conn); err != nil {
-		h.logger.Error("failed to send connected message",
+	err = h.runHandlerOperation(conn, func() error {
+		return hub.OnConnected(conn.ctx, conn)
+	})
+	if err != nil {
+		if errors.Is(err, ErrHandlerShuttingDown) {
+			_ = ws.CloseNow()
+			return
+		}
+		h.logger.Error("hub connected callback failed",
 			slog.String("connection_id", conn.ID),
 			slog.String("remote_addr", remoteAddr(conn)),
 			slog.Any("error", err),
@@ -264,15 +271,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = h.runHandlerOperation(conn, func() error {
-		return hub.OnConnected(conn.ctx, conn)
-	})
-	if err != nil {
-		if errors.Is(err, ErrHandlerShuttingDown) {
-			_ = ws.CloseNow()
-			return
-		}
-		h.logger.Error("hub connected callback failed",
+	if err = h.sendConnected(conn); err != nil {
+		h.logger.Error("failed to send connected message",
 			slog.String("connection_id", conn.ID),
 			slog.String("remote_addr", remoteAddr(conn)),
 			slog.Any("error", err),
