@@ -1,24 +1,37 @@
 package signalg
 
 import (
+	"fmt"
 	"strings"
 	"sync"
+
+	"github.com/kanengo/ku/mapx"
+	"github.com/kanengo/ku/poolx/slicepool"
 )
 
+const registryShardNum = 64
+
+type connectionSet = mapx.ShardMap[string, *Connection]
+type groupSet = mapx.ShardMap[string, struct{}]
+
+var connectionSlicePool = &slicepool.Pool[*Connection]{}
+
 type connectionRegistry struct {
-	mu             sync.RWMutex
-	connections    map[*Connection]struct{}
-	userConnIndex  map[string]map[*Connection]struct{}
-	groupConnIndex map[string]map[*Connection]struct{}
-	connGroupIndex map[*Connection]map[string]struct{}
+	connections    *mapx.ShardMap[string, *Connection]
+	userConnIndex  *mapx.ShardMap[string, *connectionSet]
+	groupConnIndex *mapx.ShardMap[string, *connectionSet]
+	connGroupIndex *mapx.ShardMap[string, *groupSet]
+
+	connLocks      stripedMutexes
+	indexInitLocks stripedMutexes
 }
 
 func newConnectionRegistry() *connectionRegistry {
 	return &connectionRegistry{
-		connections:    make(map[*Connection]struct{}),
-		userConnIndex:  make(map[string]map[*Connection]struct{}),
-		groupConnIndex: make(map[string]map[*Connection]struct{}),
-		connGroupIndex: make(map[*Connection]map[string]struct{}),
+		connections:    newConnectionMap(),
+		userConnIndex:  newConnectionSetIndex(),
+		groupConnIndex: newConnectionSetIndex(),
+		connGroupIndex: newGroupSetIndex(),
 	}
 }
 
@@ -26,20 +39,13 @@ func (r *connectionRegistry) add(conn *Connection) {
 	if conn == nil {
 		return
 	}
-	r.mu.Lock()
-	r.addLocked(conn)
-	r.mu.Unlock()
-}
+	connKey := connectionKey(conn)
+	unlockConn := r.connLocks.lock(connKey)
+	defer unlockConn()
 
-func (r *connectionRegistry) addLocked(conn *Connection) {
-	r.connections[conn] = struct{}{}
+	r.connections.Set(connKey, conn)
 	if conn.UserID != "" {
-		userConnections := r.userConnIndex[conn.UserID]
-		if userConnections == nil {
-			userConnections = make(map[*Connection]struct{})
-			r.userConnIndex[conn.UserID] = userConnections
-		}
-		userConnections[conn] = struct{}{}
+		r.connectionSetFor(r.userConnIndex, conn.UserID).Set(connKey, conn)
 	}
 }
 
@@ -47,62 +53,49 @@ func (r *connectionRegistry) remove(conn *Connection) bool {
 	if conn == nil {
 		return false
 	}
-	r.mu.Lock()
-	_, ok := r.connections[conn]
-	if !ok {
-		r.mu.Unlock()
+	connKey := connectionKey(conn)
+	unlockConn := r.connLocks.lock(connKey)
+	defer unlockConn()
+
+	registeredConn, ok := r.connections.Get(connKey)
+	if !ok || registeredConn != conn {
 		return false
 	}
-	delete(r.connections, conn)
-	if conn.UserID != "" {
-		userConnections := r.userConnIndex[conn.UserID]
-		delete(userConnections, conn)
-		if len(userConnections) == 0 {
-			delete(r.userConnIndex, conn.UserID)
-		}
+	r.connections.Delete(connKey)
+	if registeredConn.UserID != "" {
+		r.removeConnectionFromIndex(r.userConnIndex, registeredConn.UserID, connKey)
 	}
-	for group := range r.connGroupIndex[conn] {
-		groupConnections := r.groupConnIndex[group]
-		delete(groupConnections, conn)
-		if len(groupConnections) == 0 {
-			delete(r.groupConnIndex, group)
-		}
+	if connGroups, ok := r.connGroupIndex.Get(connKey); ok {
+		connGroups.Range(func(group string, _ struct{}) bool {
+			r.removeConnectionFromIndex(r.groupConnIndex, group, connKey)
+			return true
+		})
 	}
-	delete(r.connGroupIndex, conn)
-	r.mu.Unlock()
+	r.connGroupIndex.Delete(connKey)
 	return true
 }
 
 func (r *connectionRegistry) allConnections() []*Connection {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.allConnectionsLocked()
-}
-
-func (r *connectionRegistry) allConnectionsLocked() []*Connection {
-	connections := make([]*Connection, 0, len(r.connections))
-	for conn := range r.connections {
-		connections = append(connections, conn)
-	}
-	return connections
+	return r.connections.Values()
 }
 
 func (r *connectionRegistry) userOnline(userID string) int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return len(r.userConnIndex[userID])
+	userConnections, ok := r.userConnIndex.Get(userID)
+	if !ok {
+		return 0
+	}
+	return userConnections.Len()
 }
 
 func (r *connectionRegistry) userConnections(userID string) []*Connection {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return copyConnectionSet(r.userConnIndex[userID])
+	userConnections, ok := r.userConnIndex.Get(userID)
+	if !ok {
+		return nil
+	}
+	return copyConnectionSet(userConnections)
 }
 
 func (r *connectionRegistry) userSnapshot(userIDs []string) []*Connection {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
 	if len(userIDs) == 0 {
 		return nil
 	}
@@ -111,7 +104,7 @@ func (r *connectionRegistry) userSnapshot(userIDs []string) []*Connection {
 		if userID == "" {
 			return nil
 		}
-		return copyConnectionSet(r.userConnIndex[userID])
+		return r.userConnections(userID)
 	}
 
 	total := 0
@@ -119,27 +112,34 @@ func (r *connectionRegistry) userSnapshot(userIDs []string) []*Connection {
 		if userID == "" {
 			continue
 		}
-		userConnections := r.userConnIndex[userID]
-		total += len(userConnections)
+		if userConnections, ok := r.userConnIndex.Get(userID); ok {
+			total += userConnections.Len()
+		}
 	}
 	if total == 0 {
 		return nil
 	}
 
 	connections := make([]*Connection, 0, total)
-	seen := make(map[*Connection]struct{}, total)
+	seen := make(map[string]struct{}, total)
 	for _, userID := range userIDs {
 		if userID == "" {
 			continue
 		}
-		userConnections := r.userConnIndex[userID]
-		for conn := range userConnections {
-			if _, ok := seen[conn]; ok {
-				continue
-			}
-			seen[conn] = struct{}{}
-			connections = append(connections, conn)
+		userConnections, ok := r.userConnIndex.Get(userID)
+		if !ok {
+			continue
 		}
+		userConnections.Range(func(connKey string, conn *Connection) bool {
+			if _, ok := seen[connKey]; ok {
+				return true
+			}
+			seen[connKey] = struct{}{}
+			if conn != nil {
+				connections = append(connections, conn)
+			}
+			return true
+		})
 	}
 	return connections
 }
@@ -153,25 +153,16 @@ func (r *connectionRegistry) addToGroup(conn *Connection, group string) error {
 		return ErrConnectionNotFound
 	}
 
-	r.mu.Lock()
-	if _, ok := r.connections[conn]; !ok {
-		r.mu.Unlock()
+	connKey := connectionKey(conn)
+	unlockConn := r.connLocks.lock(connKey)
+	defer unlockConn()
+
+	registeredConn, ok := r.connections.Get(connKey)
+	if !ok || registeredConn != conn {
 		return ErrConnectionNotFound
 	}
-	groupConnections := r.groupConnIndex[group]
-	if groupConnections == nil {
-		groupConnections = make(map[*Connection]struct{})
-		r.groupConnIndex[group] = groupConnections
-	}
-	groupConnections[conn] = struct{}{}
-
-	connGroups := r.connGroupIndex[conn]
-	if connGroups == nil {
-		connGroups = make(map[string]struct{})
-		r.connGroupIndex[conn] = connGroups
-	}
-	connGroups[group] = struct{}{}
-	r.mu.Unlock()
+	r.connectionSetFor(r.groupConnIndex, group).Set(connKey, conn)
+	r.groupSetFor(connKey).Set(group, struct{}{})
 	return nil
 }
 
@@ -184,22 +175,16 @@ func (r *connectionRegistry) removeFromGroup(conn *Connection, group string) err
 		return ErrConnectionNotFound
 	}
 
-	r.mu.Lock()
-	if _, ok := r.connections[conn]; !ok {
-		r.mu.Unlock()
+	connKey := connectionKey(conn)
+	unlockConn := r.connLocks.lock(connKey)
+	defer unlockConn()
+
+	registeredConn, ok := r.connections.Get(connKey)
+	if !ok || registeredConn != conn {
 		return ErrConnectionNotFound
 	}
-	groupConnections := r.groupConnIndex[group]
-	delete(groupConnections, conn)
-	if len(groupConnections) == 0 {
-		delete(r.groupConnIndex, group)
-	}
-	connGroups := r.connGroupIndex[conn]
-	delete(connGroups, group)
-	if len(connGroups) == 0 {
-		delete(r.connGroupIndex, conn)
-	}
-	r.mu.Unlock()
+	r.removeConnectionFromIndex(r.groupConnIndex, group, connKey)
+	r.removeGroupFromConnection(connKey, group)
 	return nil
 }
 
@@ -207,36 +192,154 @@ func (r *connectionRegistry) removeFromAllGroups(conn *Connection) {
 	if conn == nil {
 		return
 	}
-	r.mu.Lock()
-	for group := range r.connGroupIndex[conn] {
-		groupConnections := r.groupConnIndex[group]
-		delete(groupConnections, conn)
-		if len(groupConnections) == 0 {
-			delete(r.groupConnIndex, group)
-		}
+	connKey := connectionKey(conn)
+	unlockConn := r.connLocks.lock(connKey)
+	defer unlockConn()
+
+	connGroups, ok := r.connGroupIndex.Get(connKey)
+	if !ok {
+		return
 	}
-	delete(r.connGroupIndex, conn)
-	r.mu.Unlock()
+	connGroups.Range(func(group string, _ struct{}) bool {
+		r.removeConnectionFromIndex(r.groupConnIndex, group, connKey)
+		return true
+	})
+	r.connGroupIndex.Delete(connKey)
 }
 
 func (r *connectionRegistry) groupOnline(group string) int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return len(r.groupConnIndex[group])
+	groupConnections, ok := r.groupConnIndex.Get(group)
+	if !ok {
+		return 0
+	}
+	return groupConnections.Len()
 }
 
 func (r *connectionRegistry) groupConnections(group string) []*Connection {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return copyConnectionSet(r.groupConnIndex[group])
+	groupConnections, ok := r.groupConnIndex.Get(group)
+	if !ok {
+		return nil
+	}
+	return copyConnectionSet(groupConnections)
 }
 
-func copyConnectionSet(set map[*Connection]struct{}) []*Connection {
-	connections := make([]*Connection, 0, len(set))
-	for conn := range set {
-		connections = append(connections, conn)
+func (r *connectionRegistry) connectionSetFor(index *mapx.ShardMap[string, *connectionSet], indexKey string) *connectionSet {
+	if connections, ok := index.Get(indexKey); ok {
+		return connections
+	}
+
+	unlock := r.indexInitLocks.lock(indexKey)
+	defer unlock()
+
+	connections, ok := index.Get(indexKey)
+	if !ok {
+		connections = newConnectionSet()
+		index.Set(indexKey, connections)
 	}
 	return connections
+}
+
+func (r *connectionRegistry) removeConnectionFromIndex(index *mapx.ShardMap[string, *connectionSet], indexKey, connKey string) {
+	connections, ok := index.Get(indexKey)
+	if !ok {
+		return
+	}
+	connections.Delete(connKey)
+}
+
+func (r *connectionRegistry) groupSetFor(connKey string) *groupSet {
+	connGroups, ok := r.connGroupIndex.Get(connKey)
+	if !ok {
+		connGroups = newGroupSet()
+		r.connGroupIndex.Set(connKey, connGroups)
+	}
+	return connGroups
+}
+
+func (r *connectionRegistry) removeGroupFromConnection(connKey, group string) {
+	connGroups, ok := r.connGroupIndex.Get(connKey)
+	if !ok {
+		return
+	}
+	connGroups.Delete(group)
+	if connGroups.Len() == 0 {
+		r.connGroupIndex.Delete(connKey)
+	}
+}
+
+func copyConnectionSet(set *connectionSet) []*Connection {
+	if set == nil {
+		return nil
+	}
+	connections := make([]*Connection, 0, set.Len())
+	set.Range(func(_ string, conn *Connection) bool {
+		if conn != nil {
+			connections = append(connections, conn)
+		}
+		return true
+	})
+	return connections
+}
+
+func newConnectionMap() *mapx.ShardMap[string, *Connection] {
+	return mapx.NewShardMap[string, *Connection](mapx.ShardMapOptions[string, *Connection]{
+		ShardNum: registryShardNum,
+	})
+}
+
+func newConnectionSetIndex() *mapx.ShardMap[string, *connectionSet] {
+	return mapx.NewShardMap[string, *connectionSet](mapx.ShardMapOptions[string, *connectionSet]{
+		ShardNum: registryShardNum,
+	})
+}
+
+func newGroupSetIndex() *mapx.ShardMap[string, *groupSet] {
+	return mapx.NewShardMap[string, *groupSet](mapx.ShardMapOptions[string, *groupSet]{
+		ShardNum: registryShardNum,
+	})
+}
+
+func newConnectionSet() *connectionSet {
+	return mapx.NewShardMap[string, *Connection](mapx.ShardMapOptions[string, *Connection]{
+		ShardNum: registryShardNum,
+	})
+}
+
+func newGroupSet() *groupSet {
+	return mapx.NewShardMap[string, struct{}](mapx.ShardMapOptions[string, struct{}]{
+		ShardNum: registryShardNum,
+	})
+}
+
+func connectionKey(conn *Connection) string {
+	if conn.ID == "" {
+		return fmt.Sprintf("%p", conn)
+	}
+	return conn.ID
+}
+
+type stripedMutexes struct {
+	locks [registryShardNum]sync.Mutex
+}
+
+func (s *stripedMutexes) lock(key string) func() {
+	mutex := &s.locks[lockShard(key)]
+	mutex.Lock()
+	return mutex.Unlock
+}
+
+func lockShard(key string) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+
+	hash := uint64(offset64)
+	for i := 0; i < len(key); i++ {
+		hash ^= uint64(key[i])
+		hash *= prime64
+	}
+	return hash % registryShardNum
 }
 
 func normalizeGroup(group string) string {

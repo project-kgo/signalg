@@ -90,6 +90,7 @@ type Handler struct {
 
 	registry        *connectionRegistry
 	sendConcurrency int
+	admissionMu     sync.Mutex
 	active          sync.WaitGroup
 	shuttingDown    atomic.Bool
 	online          atomic.Int64
@@ -459,14 +460,14 @@ func (h *Handler) resolveUserID(r *http.Request) (string, error) {
 }
 
 func (h *Handler) addConnection(conn *Connection) bool {
-	h.registry.mu.Lock()
+	h.admissionMu.Lock()
+	defer h.admissionMu.Unlock()
+
 	if h.shuttingDown.Load() {
-		h.registry.mu.Unlock()
 		return false
 	}
 	h.active.Add(1)
-	h.registry.addLocked(conn)
-	h.registry.mu.Unlock()
+	h.registry.add(conn)
 	h.online.Add(1)
 	return true
 }
@@ -483,10 +484,11 @@ func (h *Handler) finishConnection() {
 }
 
 func (h *Handler) beginShutdown() []drainingConnection {
-	h.registry.mu.Lock()
+	h.admissionMu.Lock()
+	defer h.admissionMu.Unlock()
+
 	h.shuttingDown.Store(true)
-	snapshot := h.registry.allConnectionsLocked()
-	h.registry.mu.Unlock()
+	snapshot := h.registry.allConnections()
 
 	connections := make([]drainingConnection, 0, len(snapshot))
 	for _, conn := range snapshot {
