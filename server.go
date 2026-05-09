@@ -501,30 +501,14 @@ func (h *Handler) beginShutdown() []drainingConnection {
 }
 
 func (h *Handler) waitConnectionsDrained(ctx context.Context, connections []drainingConnection) error {
-	if len(connections) == 0 {
-		return nil
-	}
-	var wg sync.WaitGroup
-	wg.Add(len(connections))
 	for _, draining := range connections {
-		go func(done <-chan struct{}) {
-			defer wg.Done()
-			<-done
-		}(draining.done)
+		select {
+		case <-draining.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
-
-	drained := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(drained)
-	}()
-
-	select {
-	case <-drained:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return nil
 }
 
 func (h *Handler) closeDrainingConnections(connections []drainingConnection) {
