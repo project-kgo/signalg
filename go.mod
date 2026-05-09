@@ -5,7 +5,7 @@ go 1.26
 require (
 	github.com/cloudwego/hertz v0.10.4
 	github.com/coder/websocket v1.8.14
-	github.com/kanengo/ku v0.0.0-20260506150511-c00d6785e002
+	github.com/kanengo/ku v0.0.0-20260509080754-8b6ffd5c8b59
 	github.com/matoous/go-nanoid/v2 v2.1.0
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	google.golang.org/protobuf v1.34.1
