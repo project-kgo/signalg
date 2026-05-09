@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package signalg.v1;
+
+option go_package = "github.com/project-kgo/signalg/proto/signalg/v1;signalgv1";
+
+message ConnectedConfig {
+  int64 ping_interval_ms = 1;
+}
+
+message ConnectedPayload {
+  string connection_id = 1;
+  string user_id = 2;
+  string remote_addr = 3;
+  ConnectedConfig config = 4;
+}

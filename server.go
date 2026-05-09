@@ -25,6 +25,8 @@ const (
 	// DefaultSendConcurrency is the default max concurrent connection writes
 	// for Handler batch send APIs.
 	DefaultSendConcurrency = 256
+
+	DefaultPingInterval = 15 * time.Second
 )
 
 var (
@@ -79,6 +81,7 @@ type Config struct {
 	Serialization        Serialization
 	MaxPayloadSize       int64
 	SendConcurrency      int
+	PingInterval         time.Duration
 }
 
 // Handler accepts websocket requests and dispatches lifecycle events to hubs.
@@ -147,6 +150,7 @@ func NewHandler(cfg Config, factory HubFactory) (*Handler, error) {
 	if cfg.ReadLimit == 0 {
 		cfg.ReadLimit = HeaderSize + MaxMethodNameLen + MaxInvocationIDLen + protocol.maxPayloadSize
 	}
+	cfg.PingInterval = normalizePingInterval(cfg.PingInterval)
 	sendConcurrency := normalizeSendConcurrency(cfg.SendConcurrency)
 
 	return &Handler{
@@ -247,6 +251,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer h.finishConnection()
 	defer removeConnection()
 	defer conn.closeContext()
+
+	if err = h.sendConnected(conn); err != nil {
+		h.logger.Error("failed to send connected message",
+			slog.String("connection_id", conn.ID),
+			slog.String("remote_addr", remoteAddr(conn)),
+			slog.Any("error", err),
+		)
+		removeConnection()
+		hub.OnDisconnected(conn.ctx, conn, err)
+		_ = ws.CloseNow()
+		return
+	}
 
 	err = h.runHandlerOperation(conn, func() error {
 		return hub.OnConnected(conn.ctx, conn)
@@ -526,6 +542,15 @@ func (h *Handler) runHandlerOperation(conn *Connection, fn func() error) error {
 	return fn()
 }
 
+func (h *Handler) sendConnected(conn *Connection) error {
+	payload := newConnectedPayload(conn, h.cfg.PingInterval)
+	body, err := connectedBody(payload, h.protocol.serialization())
+	if err != nil {
+		return err
+	}
+	return conn.Send(conn.ctx, ConnectedMethod, body)
+}
+
 func (h *Handler) readLoop(conn *Connection, hub Hub) error {
 	messageHub, receivesMessages := hub.(MessageHub)
 	var dispatcher *hubDispatcher
@@ -756,6 +781,13 @@ func normalizePath(p string) string {
 		p = "/" + p
 	}
 	return path.Clean(p)
+}
+
+func normalizePingInterval(d time.Duration) time.Duration {
+	if d < 0 {
+		return DefaultPingInterval
+	}
+	return d
 }
 
 func nextConnectionID() (string, error) {

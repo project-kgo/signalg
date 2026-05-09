@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	signalgv1 "github.com/project-kgo/signalg/proto/signalg/v1"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
@@ -42,6 +43,9 @@ func TestNewHandlerValidationAndDefaults(t *testing.T) {
 	if handler.protocol.maxPayloadSize != DefaultMaxPayloadSize {
 		t.Fatalf("expected default max payload %d, got %d", DefaultMaxPayloadSize, handler.protocol.maxPayloadSize)
 	}
+	if handler.cfg.PingInterval != 0 {
+		t.Fatalf("expected default ping interval 0, got %s", handler.cfg.PingInterval)
+	}
 	wantReadLimit := HeaderSize + MaxMethodNameLen + MaxInvocationIDLen + DefaultMaxPayloadSize
 	if handler.cfg.ReadLimit != wantReadLimit {
 		t.Fatalf("expected default read limit %d, got %d", wantReadLimit, handler.cfg.ReadLimit)
@@ -55,6 +59,16 @@ func TestNewHandlerValidationAndDefaults(t *testing.T) {
 	}
 	if handler.cfg.Path != "/custom" {
 		t.Fatalf("expected normalized path /custom, got %q", handler.cfg.Path)
+	}
+
+	handler, err = NewHandler(Config{PingInterval: -time.Second}, func(*Connection) (Hub, error) {
+		return &recordingHub{}, nil
+	})
+	if err != nil {
+		t.Fatalf("NewHandler returned error: %v", err)
+	}
+	if handler.cfg.PingInterval != DefaultPingInterval {
+		t.Fatalf("expected negative ping interval to normalize to %s, got %s", DefaultPingInterval, handler.cfg.PingInterval)
 	}
 
 	_, err = NewHandler(Config{Serialization: Serialization(99)}, func(*Connection) (Hub, error) {
@@ -152,6 +166,43 @@ func TestHandlerConnectionLifecycle(t *testing.T) {
 	receiveDisconnect(t, disconnected)
 }
 
+func TestHandlerSendsConnectedMessageWithConfigForSerializations(t *testing.T) {
+	for _, serialization := range []Serialization{
+		SerializationMessagePack,
+		SerializationJSON,
+		SerializationProtobuf,
+	} {
+		t.Run(serialization.String(), func(t *testing.T) {
+			handler := newTestHandler(t, Config{
+				Serialization: serialization,
+				PingInterval:  7500 * time.Millisecond,
+				UserProvider: UserProviderFunc(func(*http.Request) (string, error) {
+					return "user-1", nil
+				}),
+			}, func(*Connection) (Hub, error) {
+				return &recordingHub{}, nil
+			})
+			server := httptest.NewServer(handler)
+			defer server.Close()
+
+			client := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+			defer client.CloseNow()
+
+			msg := readRawProtocolMessage(t, handler, client)
+			if msg.Kind != FrameKindMessage {
+				t.Fatalf("expected message frame, got %s", msg.Kind)
+			}
+			if msg.Method != ConnectedMethod {
+				t.Fatalf("expected method %s, got %q", ConnectedMethod, msg.Method)
+			}
+			if msg.InvocationID != "" {
+				t.Fatalf("expected empty invocation id, got %q", msg.InvocationID)
+			}
+			assertConnectedPayload(t, msg, serialization, "user-1", 7500)
+		})
+	}
+}
+
 func TestConnectionSendWritesProtocolFrame(t *testing.T) {
 	connected := make(chan *Connection, 1)
 	handler := newTestHandler(t, Config{}, func(*Connection) (Hub, error) {
@@ -168,22 +219,12 @@ func TestConnectionSendWritesProtocolFrame(t *testing.T) {
 		t.Fatalf("Send returned error: %v", err)
 	}
 
-	typ, frame, err := client.Read(context.Background())
-	if err != nil {
-		t.Fatalf("client read: %v", err)
-	}
-	if typ != websocket.MessageBinary {
-		t.Fatalf("expected binary message, got %s", typ)
-	}
-	msg, err := handler.protocol.decodeFrame(frame)
-	if err != nil {
-		t.Fatalf("decodeFrame returned error: %v", err)
-	}
+	msg := readProtocolMessage(t, handler, client)
 	if msg.Method != "server.send" {
 		t.Fatalf("expected method server.send, got %q", msg.Method)
 	}
 	var got protocolTestBody
-	if err = msg.Decode(&got); err != nil {
+	if err := msg.Decode(&got); err != nil {
 		t.Fatalf("Decode returned error: %v", err)
 	}
 	if got.Name != "server" || got.Seq != 3 {
@@ -285,6 +326,8 @@ func TestMessageHubTakesPriorityOverDefaultDispatcher(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for protocol message")
 	}
+
+	assertConnectedMessage(t, handler, client)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -505,17 +548,7 @@ func TestConnectionSendConcurrent(t *testing.T) {
 
 	seen := make(map[string]struct{}, sends)
 	for i := 0; i < sends; i++ {
-		typ, frame, err := client.Read(context.Background())
-		if err != nil {
-			t.Fatalf("client read %d: %v", i, err)
-		}
-		if typ != websocket.MessageBinary {
-			t.Fatalf("expected binary message, got %s", typ)
-		}
-		msg, err := handler.protocol.decodeFrame(frame)
-		if err != nil {
-			t.Fatalf("decodeFrame returned error: %v", err)
-		}
+		msg := readProtocolMessage(t, handler, client)
 		seen[msg.Method] = struct{}{}
 	}
 	for i := 0; i < sends; i++ {
@@ -995,19 +1028,7 @@ func TestHandlerShutdownWaitsForInFlightMessageAndSend(t *testing.T) {
 
 	close(release)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	typ, frame, err := client.Read(ctx)
-	if err != nil {
-		t.Fatalf("client read: %v", err)
-	}
-	if typ != websocket.MessageBinary {
-		t.Fatalf("expected binary message, got %s", typ)
-	}
-	msg, err := handler.protocol.decodeFrame(frame)
-	if err != nil {
-		t.Fatalf("decodeFrame returned error: %v", err)
-	}
+	msg := readProtocolMessage(t, handler, client)
 	if msg.Method != "server.done" {
 		t.Fatalf("expected method server.done, got %q", msg.Method)
 	}
@@ -1233,7 +1254,7 @@ func newTestServer(t *testing.T, cfg ServerConfig, factory HubFactory) *Server {
 	return server
 }
 
-func readProtocolMessage(t *testing.T, handler *Handler, client *websocket.Conn) Message {
+func readRawProtocolMessage(t *testing.T, handler *Handler, client *websocket.Conn) Message {
 	t.Helper()
 
 	typ, frame, err := client.Read(context.Background())
@@ -1248,6 +1269,61 @@ func readProtocolMessage(t *testing.T, handler *Handler, client *websocket.Conn)
 		t.Fatalf("decodeFrame returned error: %v", err)
 	}
 	return msg
+}
+
+func readProtocolMessage(t *testing.T, handler *Handler, client *websocket.Conn) Message {
+	t.Helper()
+
+	for {
+		msg := readRawProtocolMessage(t, handler, client)
+		if msg.Method != ConnectedMethod {
+			return msg
+		}
+	}
+}
+
+func assertConnectedMessage(t *testing.T, handler *Handler, client *websocket.Conn) {
+	t.Helper()
+
+	msg := readRawProtocolMessage(t, handler, client)
+	if msg.Method != ConnectedMethod {
+		t.Fatalf("expected method %s, got %q", ConnectedMethod, msg.Method)
+	}
+}
+
+func assertConnectedPayload(t *testing.T, msg Message, serialization Serialization, userID string, pingIntervalMilliseconds int64) {
+	t.Helper()
+
+	if serialization == SerializationProtobuf {
+		var got signalgv1.ConnectedPayload
+		if err := msg.Decode(&got); err != nil {
+			t.Fatalf("Decode returned error: %v", err)
+		}
+		if got.GetConnectionId() == "" {
+			t.Fatal("expected connection id")
+		}
+		if got.GetUserId() != userID {
+			t.Fatalf("expected user id %q, got %q", userID, got.GetUserId())
+		}
+		if got.GetConfig().GetPingIntervalMs() != pingIntervalMilliseconds {
+			t.Fatalf("expected ping interval %dms, got %dms", pingIntervalMilliseconds, got.GetConfig().GetPingIntervalMs())
+		}
+		return
+	}
+
+	var got ConnectedPayload
+	if err := msg.Decode(&got); err != nil {
+		t.Fatalf("Decode returned error: %v", err)
+	}
+	if got.ConnectionID == "" {
+		t.Fatal("expected connection id")
+	}
+	if got.UserID != userID {
+		t.Fatalf("expected user id %q, got %q", userID, got.UserID)
+	}
+	if got.Config.PingIntervalMilliseconds != pingIntervalMilliseconds {
+		t.Fatalf("expected ping interval %dms, got %dms", pingIntervalMilliseconds, got.Config.PingIntervalMilliseconds)
+	}
 }
 
 func assertProtocolMessage(t *testing.T, handler *Handler, client *websocket.Conn, method string, want protocolTestBody) {
