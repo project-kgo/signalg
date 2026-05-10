@@ -109,7 +109,7 @@ func main() {
 	wsHandler, err := signalgHz.NewHandler(signalg.Config{
 		Path:               *path,
 		Logger:             logger,
-		Serialization:      signalg.SerializationJSON,
+		Serialization:      signalg.SerializationProtobuf,
 		PingInterval:       *pingInterval,
 		InsecureSkipVerify: *allowAllOrigins,
 		UserProvider: signalg.UserProviderFunc(func(r *http.Request) (string, error) {

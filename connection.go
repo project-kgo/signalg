@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/kanengo/ku/poolx/slicepool"
@@ -29,6 +30,12 @@ type Connection struct {
 	remoteAddr net.Addr
 	protocol   *protocolConfig
 
+	sendQueue          chan []byte
+	sendMu             sync.Mutex
+	sendClosed         bool
+	writeTimeout       time.Duration
+	slowConsumerPolicy SlowConsumerPolicy
+
 	opsMu          sync.Mutex
 	activeOps      int
 	activeHandlers int
@@ -36,23 +43,27 @@ type Connection struct {
 	opsDone        chan struct{}
 }
 
-func newConnection(id, userID string, request *http.Request, ws *websocket.Conn, protocol *protocolConfig) *Connection {
+func newConnection(id, userID string, request *http.Request, ws *websocket.Conn, protocol *protocolConfig, sendQueueSize int, writeTimeout time.Duration, slowConsumerPolicy SlowConsumerPolicy) *Connection {
 	ctx, cancel := context.WithCancel(context.Background())
 	opsDone := make(chan struct{})
 	close(opsDone)
 	conn := &Connection{
-		ID:       id,
-		UserID:   userID,
-		ctx:      ctx,
-		cancel:   cancel,
-		ws:       ws,
-		protocol: protocol,
-		opsDone:  opsDone,
+		ID:                 id,
+		UserID:             userID,
+		ctx:                ctx,
+		cancel:             cancel,
+		ws:                 ws,
+		protocol:           protocol,
+		sendQueue:          make(chan []byte, sendQueueSize),
+		writeTimeout:       writeTimeout,
+		slowConsumerPolicy: slowConsumerPolicy,
+		opsDone:            opsDone,
 	}
 	if request != nil {
 		conn.Request = request.Clone(ctx)
 		conn.remoteAddr = parseRemoteAddr(request.RemoteAddr)
 	}
+	go conn.writeLoop()
 	return conn
 }
 
@@ -74,7 +85,9 @@ func (c *Connection) CloseWithStatus(code websocket.StatusCode, reason string) e
 	if c == nil || c.ws == nil {
 		return nil
 	}
-	return c.ws.Close(code, reason)
+	err := c.ws.Close(code, reason)
+	c.closeContext()
+	return err
 }
 
 // Subprotocol returns the negotiated websocket subprotocol.
@@ -93,7 +106,7 @@ func (c *Connection) Serialization() Serialization {
 	return c.protocol.serialization()
 }
 
-// Send encodes body with the connection codec and writes one SignalG binary frame.
+// Send encodes body with the connection codec and queues one SignalG binary frame.
 func (c *Connection) Send(ctx context.Context, method string, body any) error {
 	if c == nil || c.ws == nil {
 		return errors.New("signalg: nil websocket connection")
@@ -104,11 +117,14 @@ func (c *Connection) Send(ctx context.Context, method string, body any) error {
 	if !c.beginSendOperation() {
 		return ErrHandlerShuttingDown
 	}
-	defer c.endOperation()
-	return c.writeEncodedProtocolFrame(ctx, FrameKindMessage, method, "", body)
+	if err := c.writeEncodedProtocolFrame(ctx, FrameKindMessage, method, "", body); err != nil {
+		c.endOperation()
+		return err
+	}
+	return nil
 }
 
-// SendRaw writes one SignalG binary frame with an already-encoded payload.
+// SendRaw queues one SignalG binary frame with an already-encoded payload.
 func (c *Connection) SendRaw(ctx context.Context, method string, payload []byte) error {
 	if c == nil || c.ws == nil {
 		return errors.New("signalg: nil websocket connection")
@@ -119,11 +135,14 @@ func (c *Connection) SendRaw(ctx context.Context, method string, payload []byte)
 	if !c.beginSendOperation() {
 		return ErrHandlerShuttingDown
 	}
-	defer c.endOperation()
-	return c.writeRawProtocolFrame(ctx, FrameKindMessage, method, "", payload)
+	if err := c.writeRawProtocolFrame(ctx, FrameKindMessage, method, "", payload); err != nil {
+		c.endOperation()
+		return err
+	}
+	return nil
 }
 
-// Complete writes one successful invocation completion frame.
+// Complete queues one successful invocation completion frame.
 func (c *Connection) Complete(ctx context.Context, invocationID string, body any) error {
 	if c == nil || c.ws == nil {
 		return errors.New("signalg: nil websocket connection")
@@ -134,11 +153,14 @@ func (c *Connection) Complete(ctx context.Context, invocationID string, body any
 	if !c.beginSendOperation() {
 		return ErrHandlerShuttingDown
 	}
-	defer c.endOperation()
-	return c.writeEncodedProtocolFrame(ctx, FrameKindCompletion, "", invocationID, body)
+	if err := c.writeEncodedProtocolFrame(ctx, FrameKindCompletion, "", invocationID, body); err != nil {
+		c.endOperation()
+		return err
+	}
+	return nil
 }
 
-// CompleteError writes one failed invocation completion frame.
+// CompleteError queues one failed invocation completion frame.
 func (c *Connection) CompleteError(ctx context.Context, invocationID string, err error) error {
 	if c == nil || c.ws == nil {
 		return errors.New("signalg: nil websocket connection")
@@ -149,14 +171,17 @@ func (c *Connection) CompleteError(ctx context.Context, invocationID string, err
 	if !c.beginSendOperation() {
 		return ErrHandlerShuttingDown
 	}
-	defer c.endOperation()
 	if err == nil {
 		err = errors.New("signalg: invocation failed")
 	}
-	return c.writeRawProtocolFrame(ctx, FrameKindError, "", invocationID, []byte(err.Error()))
+	if writeErr := c.writeRawProtocolFrame(ctx, FrameKindError, "", invocationID, []byte(err.Error())); writeErr != nil {
+		c.endOperation()
+		return writeErr
+	}
+	return nil
 }
 
-// Ping writes one SignalG protocol-level heartbeat ping frame.
+// Ping queues one SignalG protocol-level heartbeat ping frame.
 func (c *Connection) Ping(ctx context.Context) error {
 	if c == nil || c.ws == nil {
 		return errors.New("signalg: nil websocket connection")
@@ -167,11 +192,14 @@ func (c *Connection) Ping(ctx context.Context) error {
 	if !c.beginSendOperation() {
 		return ErrHandlerShuttingDown
 	}
-	defer c.endOperation()
-	return c.writeRawProtocolFrame(ctx, FrameKindPing, "", "", nil)
+	if err := c.writeRawProtocolFrame(ctx, FrameKindPing, "", "", nil); err != nil {
+		c.endOperation()
+		return err
+	}
+	return nil
 }
 
-// Pong writes one SignalG protocol-level heartbeat pong frame.
+// Pong queues one SignalG protocol-level heartbeat pong frame.
 func (c *Connection) Pong(ctx context.Context) error {
 	if c == nil || c.ws == nil {
 		return errors.New("signalg: nil websocket connection")
@@ -182,8 +210,11 @@ func (c *Connection) Pong(ctx context.Context) error {
 	if !c.beginSendOperation() {
 		return ErrHandlerShuttingDown
 	}
-	defer c.endOperation()
-	return c.writeRawProtocolFrame(ctx, FrameKindPong, "", "", nil)
+	if err := c.writeRawProtocolFrame(ctx, FrameKindPong, "", "", nil); err != nil {
+		c.endOperation()
+		return err
+	}
+	return nil
 }
 
 func (c *Connection) writeEncodedProtocolFrame(ctx context.Context, kind FrameKind, method, invocationID string, body any) error {
@@ -192,18 +223,22 @@ func (c *Connection) writeEncodedProtocolFrame(ctx context.Context, kind FrameKi
 	}
 
 	frame := getFrameBuffer(HeaderSize + len(method) + len(invocationID) + 512)
-	defer putFrameBuffer(frame)
 
 	frame = append(frame, emptyFrameHeader[:]...)
 	frame = append(frame, method...)
 	frame = append(frame, invocationID...)
 
+	prefixFrame := frame
 	var err error
 	frame, err = c.protocol.marshalAppend(frame, body)
+	if !sameFrameBuffer(prefixFrame, frame) {
+		putFrameBuffer(prefixFrame)
+	}
 	if err != nil {
+		putFrameBuffer(frame)
 		return err
 	}
-	return c.writePreparedProtocolFrame(ctx, kind, method, invocationID, frame)
+	return c.enqueuePreparedProtocolFrame(ctx, kind, method, invocationID, frame)
 }
 
 func (c *Connection) writeRawProtocolFrame(ctx context.Context, kind FrameKind, method, invocationID string, payload []byte) error {
@@ -215,13 +250,12 @@ func (c *Connection) writeRawProtocolFrame(ctx context.Context, kind FrameKind, 
 	}
 
 	frame := getFrameBuffer(HeaderSize + len(method) + len(invocationID) + len(payload))
-	defer putFrameBuffer(frame)
 
 	frame = append(frame, emptyFrameHeader[:]...)
 	frame = append(frame, method...)
 	frame = append(frame, invocationID...)
 	frame = append(frame, payload...)
-	return c.writePreparedProtocolFrame(ctx, kind, method, invocationID, frame)
+	return c.enqueuePreparedProtocolFrame(ctx, kind, method, invocationID, frame)
 }
 
 func validateProtocolFrame(kind FrameKind, method, invocationID string) error {
@@ -258,13 +292,15 @@ func validateProtocolFrame(kind FrameKind, method, invocationID string) error {
 	return nil
 }
 
-func (c *Connection) writePreparedProtocolFrame(ctx context.Context, kind FrameKind, method, invocationID string, frame []byte) error {
+func (c *Connection) enqueuePreparedProtocolFrame(ctx context.Context, kind FrameKind, method, invocationID string, frame []byte) error {
 	prefixLen := HeaderSize + len(method) + len(invocationID)
 	if len(frame) < prefixLen {
+		putFrameBuffer(frame)
 		return fmt.Errorf("%w: frame shorter than header", ErrInvalidFrame)
 	}
 	bodyLen := len(frame) - prefixLen
 	if err := c.protocol.ensurePayloadSize(bodyLen); err != nil {
+		putFrameBuffer(frame)
 		return err
 	}
 	encodeFrameHeader(frame[:HeaderSize], FrameHeader{
@@ -275,7 +311,113 @@ func (c *Connection) writePreparedProtocolFrame(ctx context.Context, kind FrameK
 		InvocationIDLen: uint8(len(invocationID)),
 		BodyLen:         uint32(bodyLen),
 	})
-	return c.ws.Write(ctx, websocket.MessageBinary, frame)
+	return c.enqueueFrame(ctx, frame)
+}
+
+func (c *Connection) enqueueFrame(ctx context.Context, frame []byte) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		putFrameBuffer(frame)
+		return ctx.Err()
+	case <-c.ctx.Done():
+		putFrameBuffer(frame)
+		return c.ctx.Err()
+	default:
+	}
+
+	c.sendMu.Lock()
+	if c.sendClosed {
+		c.sendMu.Unlock()
+		putFrameBuffer(frame)
+		return c.closedSendQueueError()
+	}
+	select {
+	case c.sendQueue <- frame:
+		c.sendMu.Unlock()
+		return nil
+	case <-c.ctx.Done():
+		c.sendMu.Unlock()
+		putFrameBuffer(frame)
+		return c.ctx.Err()
+	default:
+		c.sendMu.Unlock()
+		putFrameBuffer(frame)
+		c.disconnectSlowConsumer()
+		return ErrSlowConsumer
+	}
+}
+
+func (c *Connection) closedSendQueueError() error {
+	if err := c.ctx.Err(); err != nil {
+		return err
+	}
+	return ErrHandlerShuttingDown
+}
+
+func (c *Connection) writeLoop() {
+	for {
+		select {
+		case frame := <-c.sendQueue:
+			if !c.writeQueuedFrame(frame) {
+				c.discardQueuedFrames()
+				return
+			}
+		case <-c.ctx.Done():
+			c.discardQueuedFrames()
+			return
+		}
+	}
+}
+
+func (c *Connection) writeQueuedFrame(frame []byte) bool {
+	defer c.endOperation()
+	defer putFrameBuffer(frame)
+
+	ctx := c.ctx
+	var cancel context.CancelFunc
+	if c.writeTimeout > 0 {
+		ctx, cancel = context.WithTimeout(c.ctx, c.writeTimeout)
+		defer cancel()
+	}
+
+	if err := c.ws.Write(ctx, websocket.MessageBinary, frame); err != nil {
+		c.closeContext()
+		_ = c.closeNow()
+		return false
+	}
+	return true
+}
+
+func (c *Connection) discardQueuedFrames() {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	if c.sendClosed {
+		return
+	}
+	c.sendClosed = true
+	for {
+		select {
+		case frame := <-c.sendQueue:
+			putFrameBuffer(frame)
+			c.endOperation()
+		default:
+			return
+		}
+	}
+}
+
+func (c *Connection) disconnectSlowConsumer() {
+	switch c.slowConsumerPolicy {
+	case SlowConsumerPolicyDisconnect:
+		c.closeContext()
+		_ = c.closeNow()
+	default:
+		c.closeContext()
+		_ = c.closeNow()
+	}
 }
 
 func (c *Connection) closeContext() {
@@ -402,4 +544,11 @@ func getFrameBuffer(size int) []byte {
 
 func putFrameBuffer(frame []byte) {
 	frameBufferPool.Put(frame[:0])
+}
+
+func sameFrameBuffer(a, b []byte) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return len(a) == len(b)
+	}
+	return &a[0] == &b[0]
 }

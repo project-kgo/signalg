@@ -26,7 +26,15 @@ const (
 	// for Handler batch send APIs.
 	DefaultSendConcurrency = 256
 
+	// DefaultSendQueueSize is the default bounded outbound queue size for one
+	// websocket connection.
+	DefaultSendQueueSize = 256
+
 	DefaultPingInterval = 15 * time.Second
+
+	// DefaultWriteTimeout bounds one websocket write from the per-connection
+	// writer goroutine.
+	DefaultWriteTimeout = 5 * time.Second
 )
 
 var (
@@ -36,6 +44,17 @@ var (
 	ErrHandlerShuttingDown = errors.New("signalg: handler is shutting down")
 	ErrConnectionNotFound  = errors.New("signalg: connection is not managed by handler")
 	ErrInvalidGroup        = errors.New("signalg: invalid group")
+	ErrSlowConsumer        = errors.New("signalg: slow consumer")
+)
+
+// SlowConsumerPolicy selects the action taken when a connection cannot accept
+// more outbound frames.
+type SlowConsumerPolicy uint8
+
+const (
+	// SlowConsumerPolicyDisconnect closes the websocket connection when its
+	// bounded outbound queue is full.
+	SlowConsumerPolicyDisconnect SlowConsumerPolicy = iota
 )
 
 // Hub handles lifecycle events for one websocket connection.
@@ -81,6 +100,9 @@ type Config struct {
 	Serialization        Serialization
 	MaxPayloadSize       int64
 	SendConcurrency      int
+	SendQueueSize        int
+	WriteTimeout         time.Duration
+	SlowConsumerPolicy   SlowConsumerPolicy
 	PingInterval         time.Duration
 	PingTimeout          time.Duration
 }
@@ -92,20 +114,24 @@ type Handler struct {
 	logger   *slog.Logger
 	protocol *protocolConfig
 
-	registry          *connectionRegistry
-	sendConcurrency   int
-	admissionMu       sync.Mutex
-	active            sync.WaitGroup
-	shuttingDown      atomic.Bool
-	online            atomic.Int64
-	shutdownOnce      sync.Once
-	shutdownErr       error
-	heartbeatWake     chan struct{}
-	heartbeatStop     chan struct{}
-	heartbeatStopOnce sync.Once
+	registry           *connectionRegistry
+	sendConcurrency    int
+	sendQueueSize      int
+	writeTimeout       time.Duration
+	slowConsumerPolicy SlowConsumerPolicy
+	admissionMu        sync.Mutex
+	active             sync.WaitGroup
+	shuttingDown       atomic.Bool
+	online             atomic.Int64
+	shutdownOnce       sync.Once
+	shutdownErr        error
+	heartbeatWake      chan struct{}
+	heartbeatStop      chan struct{}
+	heartbeatStopOnce  sync.Once
 }
 
-// SendResult describes a batch send operation outcome.
+// SendResult describes a batch send operation outcome. Sent counts frames
+// accepted by per-connection outbound queues.
 type SendResult struct {
 	Matched int
 	Sent    int
@@ -156,17 +182,22 @@ func NewHandler(cfg Config, factory HubFactory) (*Handler, error) {
 	}
 	cfg.PingInterval = normalizePingInterval(cfg.PingInterval)
 	cfg.PingTimeout = normalizePingTimeout(cfg.PingTimeout, cfg.PingInterval)
+	cfg.SendQueueSize = normalizeSendQueueSize(cfg.SendQueueSize)
+	cfg.WriteTimeout = normalizeWriteTimeout(cfg.WriteTimeout)
 	sendConcurrency := normalizeSendConcurrency(cfg.SendConcurrency)
 
 	h := &Handler{
-		cfg:             cfg,
-		factory:         factory,
-		logger:          cfg.Logger,
-		protocol:        protocol,
-		registry:        newConnectionRegistry(),
-		sendConcurrency: sendConcurrency,
-		heartbeatWake:   make(chan struct{}, 1),
-		heartbeatStop:   make(chan struct{}),
+		cfg:                cfg,
+		factory:            factory,
+		logger:             cfg.Logger,
+		protocol:           protocol,
+		registry:           newConnectionRegistry(),
+		sendConcurrency:    sendConcurrency,
+		sendQueueSize:      cfg.SendQueueSize,
+		writeTimeout:       cfg.WriteTimeout,
+		slowConsumerPolicy: cfg.SlowConsumerPolicy,
+		heartbeatWake:      make(chan struct{}, 1),
+		heartbeatStop:      make(chan struct{}),
 	}
 	if h.heartbeatEnabled() {
 		go h.heartbeatLoop()
@@ -220,7 +251,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn := newConnection(connectionID, userID, r, ws, h.protocol)
+	conn := newConnection(connectionID, userID, r, ws, h.protocol, h.sendQueueSize, h.writeTimeout, h.slowConsumerPolicy)
 	if h.cfg.ReadLimit != 0 {
 		ws.SetReadLimit(h.cfg.ReadLimit)
 	}
@@ -892,6 +923,20 @@ func normalizePingTimeout(timeout, interval time.Duration) time.Duration {
 		return 5 * interval
 	}
 	return timeout
+}
+
+func normalizeSendQueueSize(n int) int {
+	if n <= 0 {
+		return DefaultSendQueueSize
+	}
+	return n
+}
+
+func normalizeWriteTimeout(d time.Duration) time.Duration {
+	if d <= 0 {
+		return DefaultWriteTimeout
+	}
+	return d
 }
 
 func nextConnectionID() (string, error) {

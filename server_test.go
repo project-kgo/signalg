@@ -53,6 +53,12 @@ func TestNewHandlerValidationAndDefaults(t *testing.T) {
 	if handler.cfg.ReadLimit != wantReadLimit {
 		t.Fatalf("expected default read limit %d, got %d", wantReadLimit, handler.cfg.ReadLimit)
 	}
+	if handler.cfg.SendQueueSize != DefaultSendQueueSize {
+		t.Fatalf("expected default send queue size %d, got %d", DefaultSendQueueSize, handler.cfg.SendQueueSize)
+	}
+	if handler.cfg.WriteTimeout != DefaultWriteTimeout {
+		t.Fatalf("expected default write timeout %s, got %s", DefaultWriteTimeout, handler.cfg.WriteTimeout)
+	}
 
 	handler, err = NewHandler(Config{Path: "custom"}, func(*Connection) (Hub, error) {
 		return &recordingHub{}, nil
@@ -614,6 +620,166 @@ func TestConnectionSendConcurrent(t *testing.T) {
 		if _, ok := seen[method]; !ok {
 			t.Fatalf("missing sent method %s", method)
 		}
+	}
+}
+
+func TestConnectionSendQueueFullDisconnectsSlowConsumer(t *testing.T) {
+	protocol, err := newProtocolConfig(SerializationMessagePack, 0)
+	if err != nil {
+		t.Fatalf("newProtocolConfig returned error: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	opsDone := make(chan struct{})
+	close(opsDone)
+	conn := &Connection{
+		ID:        "slow",
+		ctx:       ctx,
+		cancel:    cancel,
+		protocol:  protocol,
+		sendQueue: make(chan []byte, 1),
+		opsDone:   opsDone,
+	}
+
+	if !conn.beginSendOperation() {
+		t.Fatal("expected first send operation to begin")
+	}
+	if err := conn.writeRawProtocolFrame(context.Background(), FrameKindMessage, "server.one", "", []byte("1")); err != nil {
+		conn.endOperation()
+		t.Fatalf("first enqueue returned error: %v", err)
+	}
+
+	if !conn.beginSendOperation() {
+		t.Fatal("expected second send operation to begin")
+	}
+	err = conn.writeRawProtocolFrame(context.Background(), FrameKindMessage, "server.two", "", []byte("2"))
+	if !errors.Is(err, ErrSlowConsumer) {
+		conn.endOperation()
+		t.Fatalf("expected ErrSlowConsumer, got %v", err)
+	}
+	conn.endOperation()
+
+	select {
+	case <-conn.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("expected queue-full slow consumer to cancel connection context")
+	}
+
+	done := conn.beginDrain()
+	select {
+	case <-done:
+		t.Fatal("expected queued frame to keep drain open")
+	default:
+	}
+
+	frame := <-conn.sendQueue
+	putFrameBuffer(frame)
+	conn.endOperation()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("expected drain to finish after queued frame is released")
+	}
+}
+
+func TestConnectionRejectsSendAfterQueueClosed(t *testing.T) {
+	protocol, err := newProtocolConfig(SerializationMessagePack, 0)
+	if err != nil {
+		t.Fatalf("newProtocolConfig returned error: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	opsDone := make(chan struct{})
+	close(opsDone)
+	conn := &Connection{
+		ID:        "closed",
+		ctx:       ctx,
+		cancel:    cancel,
+		protocol:  protocol,
+		sendQueue: make(chan []byte, 1),
+		opsDone:   opsDone,
+	}
+	conn.sendClosed = true
+
+	if !conn.beginSendOperation() {
+		t.Fatal("expected send operation to begin")
+	}
+	err = conn.writeRawProtocolFrame(context.Background(), FrameKindMessage, "server.late", "", []byte("late"))
+	if !errors.Is(err, ErrHandlerShuttingDown) {
+		conn.endOperation()
+		t.Fatalf("expected ErrHandlerShuttingDown, got %v", err)
+	}
+	conn.endOperation()
+
+	done := conn.beginDrain()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("expected closed queue send failure to release operation")
+	}
+}
+
+func TestConnectionDrainAllowsSendFromActiveHandler(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	opsDone := make(chan struct{})
+	close(opsDone)
+	conn := &Connection{
+		ID:      "handler-drain",
+		ctx:     ctx,
+		cancel:  cancel,
+		opsDone: opsDone,
+	}
+
+	if !conn.beginHandlerOperation() {
+		t.Fatal("expected handler operation to begin")
+	}
+	done := conn.beginDrain()
+	select {
+	case <-done:
+		t.Fatal("expected active handler to keep drain open")
+	default:
+	}
+
+	if !conn.beginSendOperation() {
+		t.Fatal("expected active handler to allow send during drain")
+	}
+	conn.endHandlerOperation()
+	select {
+	case <-done:
+		t.Fatal("expected queued send operation to keep drain open after handler returns")
+	default:
+	}
+
+	conn.endOperation()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("expected drain to finish after handler and send operations end")
+	}
+}
+
+func TestConnectionDrainRejectsSendWithoutActiveHandler(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	opsDone := make(chan struct{})
+	close(opsDone)
+	conn := &Connection{
+		ID:      "no-handler-drain",
+		ctx:     ctx,
+		cancel:  cancel,
+		opsDone: opsDone,
+	}
+
+	done := conn.beginDrain()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("expected idle connection drain to already be done")
+	}
+	if conn.beginSendOperation() {
+		conn.endOperation()
+		t.Fatal("expected send without active handler to be rejected during drain")
 	}
 }
 
