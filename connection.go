@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -16,6 +17,12 @@ import (
 var emptyFrameHeader [HeaderSize]byte
 
 var frameBufferPool = &slicepool.Pool[byte]{}
+
+const (
+	defaultEncodedPayloadSizeHint = 128
+	encodedPayloadHeadroomDivisor = 8
+	encodedPayloadDecayDivisor    = 8
+)
 
 // Connection represents one websocket connection managed by SignalG.
 type Connection struct {
@@ -35,6 +42,7 @@ type Connection struct {
 	sendClosed         bool
 	writeTimeout       time.Duration
 	slowConsumerPolicy SlowConsumerPolicy
+	encodedPayloadHint atomic.Int64
 
 	opsMu          sync.Mutex
 	activeOps      int
@@ -222,7 +230,8 @@ func (c *Connection) writeEncodedProtocolFrame(ctx context.Context, kind FrameKi
 		return err
 	}
 
-	frame := getFrameBuffer(HeaderSize + len(method) + len(invocationID) + 512)
+	prefixLen := HeaderSize + len(method) + len(invocationID)
+	frame := getFrameBuffer(c.encodedFrameBufferSize(prefixLen))
 
 	frame = append(frame, emptyFrameHeader[:]...)
 	frame = append(frame, method...)
@@ -238,6 +247,12 @@ func (c *Connection) writeEncodedProtocolFrame(ctx context.Context, kind FrameKi
 		putFrameBuffer(frame)
 		return err
 	}
+	bodyLen := len(frame) - prefixLen
+	if err := c.protocol.ensurePayloadSize(bodyLen); err != nil {
+		putFrameBuffer(frame)
+		return err
+	}
+	c.observeEncodedPayloadSize(bodyLen)
 	return c.enqueuePreparedProtocolFrame(ctx, kind, method, invocationID, frame)
 }
 
@@ -551,4 +566,41 @@ func sameFrameBuffer(a, b []byte) bool {
 		return len(a) == len(b)
 	}
 	return &a[0] == &b[0]
+}
+
+func (c *Connection) encodedFrameBufferSize(prefixLen int) int {
+	bodyHint := defaultEncodedPayloadSizeHint
+	if c != nil {
+		if hint := c.encodedPayloadHint.Load(); hint > 0 {
+			bodyHint = int(hint)
+		}
+	}
+
+	bodyHint += bodyHint / encodedPayloadHeadroomDivisor
+	if c != nil && c.protocol != nil && c.protocol.maxPayloadSize > 0 && int64(bodyHint) > c.protocol.maxPayloadSize {
+		bodyHint = int(c.protocol.maxPayloadSize)
+	}
+	return prefixLen + bodyHint
+}
+
+func (c *Connection) observeEncodedPayloadSize(size int) {
+	if c == nil {
+		return
+	}
+	if size < defaultEncodedPayloadSizeHint {
+		size = defaultEncodedPayloadSizeHint
+	}
+
+	nextSample := int64(size)
+	for {
+		current := c.encodedPayloadHint.Load()
+		next := nextSample
+		// Grow immediately to avoid repeated reallocations, then decay gradually as payloads shrink.
+		if current > 0 && nextSample < current {
+			next = current - (current-nextSample)/encodedPayloadDecayDivisor
+		}
+		if c.encodedPayloadHint.CompareAndSwap(current, next) {
+			return
+		}
+	}
 }
