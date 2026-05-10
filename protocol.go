@@ -78,6 +78,10 @@ const (
 	FrameKindCompletion
 	// FrameKindError is a failed invocation result.
 	FrameKindError
+	// FrameKindPing is a SignalG protocol-level heartbeat ping.
+	FrameKindPing
+	// FrameKindPong is a SignalG protocol-level heartbeat pong.
+	FrameKindPong
 )
 
 func (k FrameKind) String() string {
@@ -90,6 +94,10 @@ func (k FrameKind) String() string {
 		return "completion"
 	case FrameKindError:
 		return "error"
+	case FrameKindPing:
+		return "ping"
+	case FrameKindPong:
+		return "pong"
 	default:
 		return fmt.Sprintf("unknown(%d)", k)
 	}
@@ -236,10 +244,20 @@ func decodeFrame(frame []byte, codec BodyCodec, maxPayloadSize int64) (Message, 
 	if err := validateFrameKind(header.Kind); err != nil {
 		return Message{}, err
 	}
-	if (header.Kind == FrameKindMessage || header.Kind == FrameKindInvoke) && header.MethodLen == 0 {
+	if isControlFrameKind(header.Kind) {
+		if header.MethodLen != 0 {
+			return Message{}, fmt.Errorf("%w: control frame method must be empty", ErrInvalidMethodName)
+		}
+		if header.InvocationIDLen != 0 {
+			return Message{}, fmt.Errorf("%w: control frame invocation id must be empty", ErrInvalidInvocationID)
+		}
+		if header.BodyLen != 0 {
+			return Message{}, fmt.Errorf("%w: control frame body must be empty", ErrInvalidFrame)
+		}
+	} else if (header.Kind == FrameKindMessage || header.Kind == FrameKindInvoke) && header.MethodLen == 0 {
 		return Message{}, fmt.Errorf("%w: method name is empty", ErrInvalidMethodName)
 	}
-	if header.Kind != FrameKindMessage && header.InvocationIDLen == 0 {
+	if !isControlFrameKind(header.Kind) && header.Kind != FrameKindMessage && header.InvocationIDLen == 0 {
 		return Message{}, fmt.Errorf("%w: invocation id is empty", ErrInvalidInvocationID)
 	}
 	if int64(header.BodyLen) > maxPayloadSize {
@@ -306,11 +324,15 @@ func validateInvocationID(invocationID string) error {
 
 func validateFrameKind(kind FrameKind) error {
 	switch kind {
-	case FrameKindMessage, FrameKindInvoke, FrameKindCompletion, FrameKindError:
+	case FrameKindMessage, FrameKindInvoke, FrameKindCompletion, FrameKindError, FrameKindPing, FrameKindPong:
 		return nil
 	default:
 		return fmt.Errorf("%w: %s", ErrInvalidFrameKind, kind)
 	}
+}
+
+func isControlFrameKind(kind FrameKind) bool {
+	return kind == FrameKindPing || kind == FrameKindPong
 }
 
 type messagePackCodec struct{}

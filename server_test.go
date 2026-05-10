@@ -46,6 +46,9 @@ func TestNewHandlerValidationAndDefaults(t *testing.T) {
 	if handler.cfg.PingInterval != 0 {
 		t.Fatalf("expected default ping interval 0, got %s", handler.cfg.PingInterval)
 	}
+	if handler.cfg.PingTimeout != 0 {
+		t.Fatalf("expected default ping timeout 0, got %s", handler.cfg.PingTimeout)
+	}
 	wantReadLimit := HeaderSize + MaxMethodNameLen + MaxInvocationIDLen + DefaultMaxPayloadSize
 	if handler.cfg.ReadLimit != wantReadLimit {
 		t.Fatalf("expected default read limit %d, got %d", wantReadLimit, handler.cfg.ReadLimit)
@@ -69,6 +72,9 @@ func TestNewHandlerValidationAndDefaults(t *testing.T) {
 	}
 	if handler.cfg.PingInterval != DefaultPingInterval {
 		t.Fatalf("expected negative ping interval to normalize to %s, got %s", DefaultPingInterval, handler.cfg.PingInterval)
+	}
+	if handler.cfg.PingTimeout != 5*DefaultPingInterval {
+		t.Fatalf("expected default ping timeout to normalize to %s, got %s", 5*DefaultPingInterval, handler.cfg.PingTimeout)
 	}
 
 	_, err = NewHandler(Config{Serialization: Serialization(99)}, func(*Connection) (Hub, error) {
@@ -262,6 +268,58 @@ func TestMessageHubReceivesProtocolMessage(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for protocol message")
+	}
+}
+
+func TestHandlerRespondsToProtocolPingWithoutDispatching(t *testing.T) {
+	messages := make(chan Message, 1)
+	handler := newTestHandler(t, Config{}, func(*Connection) (Hub, error) {
+		return &recordingMessageHub{messages: messages}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client.CloseNow()
+
+	frame := encodeControlTestFrame(t, handler.protocol.codec, FrameKindPing)
+	if err := client.Write(context.Background(), websocket.MessageBinary, frame); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+
+	msg := readProtocolMessage(t, handler, client)
+	if msg.Kind != FrameKindPong {
+		t.Fatalf("expected pong frame, got %s", msg.Kind)
+	}
+	if msg.Method != "" || msg.InvocationID != "" || len(msg.Payload) != 0 {
+		t.Fatalf("unexpected pong frame: %#v", msg)
+	}
+
+	select {
+	case msg := <-messages:
+		t.Fatalf("expected ping to stay in framework layer, got message %#v", msg)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestHandlerHeartbeatTimeoutClosesIdleConnection(t *testing.T) {
+	disconnected := make(chan error, 1)
+	handler := newTestHandler(t, Config{
+		PingInterval: 20 * time.Millisecond,
+		PingTimeout:  50 * time.Millisecond,
+	}, func(*Connection) (Hub, error) {
+		return &recordingHub{disconnected: disconnected}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client.CloseNow()
+
+	assertConnectedMessage(t, handler, client)
+	receiveDisconnect(t, disconnected)
+	if got := handler.Online(); got != 0 {
+		t.Fatalf("expected zero online connections, got %d", got)
 	}
 }
 
@@ -1431,6 +1489,31 @@ func assertContainsConnection(t *testing.T, connections []*Connection, want *Con
 
 func httpToWS(url string) string {
 	return "ws" + strings.TrimPrefix(url, "http")
+}
+
+func TestConnectionRegistryExpiresFromLastSeenListHead(t *testing.T) {
+	registry := newConnectionRegistry()
+	active := &Connection{ID: "active", UserID: "user-1"}
+	idle := &Connection{ID: "idle", UserID: "user-1"}
+	registry.add(active)
+	registry.add(idle)
+
+	now := time.Now()
+	if node, ok := registry.connections.Get(connectionKey(active)); ok {
+		node.lastSeen = now.Add(-time.Minute)
+	}
+	if node, ok := registry.connections.Get(connectionKey(idle)); ok {
+		node.lastSeen = now.Add(-time.Minute)
+	}
+	registry.touch(active)
+
+	expired := registry.expired(time.Now(), time.Second)
+	if len(expired) != 1 || expired[0] != idle {
+		t.Fatalf("expected only idle connection to expire from list head, got %#v", expired)
+	}
+	if connections := registry.allConnections(); len(connections) != 1 || connections[0] != active {
+		t.Fatalf("expected active connection to remain after touch, got %#v", connections)
+	}
 }
 
 func BenchmarkConnectionRegistrySnapshots50K(b *testing.B) {

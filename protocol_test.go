@@ -155,6 +155,32 @@ func TestInvokeProtocolFrameRoundTrip(t *testing.T) {
 	})
 }
 
+func TestControlProtocolFrameRoundTrip(t *testing.T) {
+	codec := mustCodec(t, SerializationMessagePack)
+	for _, kind := range []FrameKind{FrameKindPing, FrameKindPong} {
+		t.Run(kind.String(), func(t *testing.T) {
+			frame := encodeControlTestFrame(t, codec, kind)
+
+			msg, err := decodeFrame(frame, codec, DefaultMaxPayloadSize)
+			if err != nil {
+				t.Fatalf("decodeFrame returned error: %v", err)
+			}
+			if msg.Kind != kind {
+				t.Fatalf("expected kind %s, got %s", kind, msg.Kind)
+			}
+			if msg.Method != "" {
+				t.Fatalf("expected empty method, got %q", msg.Method)
+			}
+			if msg.InvocationID != "" {
+				t.Fatalf("expected empty invocation id, got %q", msg.InvocationID)
+			}
+			if len(msg.Payload) != 0 {
+				t.Fatalf("expected empty payload, got %q", msg.Payload)
+			}
+		})
+	}
+}
+
 func TestProtocolFrameValidation(t *testing.T) {
 	codec := mustCodec(t, SerializationMessagePack)
 	frame := encodeTestFrame(t, codec, "ok", protocolTestBody{Name: "ok"})
@@ -219,6 +245,27 @@ func TestProtocolFrameValidation(t *testing.T) {
 			t.Fatalf("expected ErrPayloadTooLarge, got %v", err)
 		}
 	})
+
+	t.Run("control frame rejects method", func(t *testing.T) {
+		_, err := decodeFrame(encodeInvokeTestFrameRaw(t, codec, FrameKindPing, "bad", "", nil), codec, DefaultMaxPayloadSize)
+		if !errors.Is(err, ErrInvalidMethodName) {
+			t.Fatalf("expected ErrInvalidMethodName, got %v", err)
+		}
+	})
+
+	t.Run("control frame rejects invocation id", func(t *testing.T) {
+		_, err := decodeFrame(encodeInvokeTestFrameRaw(t, codec, FrameKindPong, "", "bad", nil), codec, DefaultMaxPayloadSize)
+		if !errors.Is(err, ErrInvalidInvocationID) {
+			t.Fatalf("expected ErrInvalidInvocationID, got %v", err)
+		}
+	})
+
+	t.Run("control frame rejects body", func(t *testing.T) {
+		_, err := decodeFrame(encodeInvokeTestFrameRaw(t, codec, FrameKindPing, "", "", []byte("bad")), codec, DefaultMaxPayloadSize)
+		if !errors.Is(err, ErrInvalidFrame) {
+			t.Fatalf("expected ErrInvalidFrame, got %v", err)
+		}
+	})
 }
 
 func TestValidateMethodName(t *testing.T) {
@@ -258,6 +305,12 @@ func encodeInvokeTestFrame(t *testing.T, codec BodyCodec, kind FrameKind, method
 	return encodeProtocolTestFrame(t, codec, kind, method, invocationID, body)
 }
 
+func encodeControlTestFrame(t *testing.T, codec BodyCodec, kind FrameKind) []byte {
+	t.Helper()
+
+	return encodeInvokeTestFrameRaw(t, codec, kind, "", "", nil)
+}
+
 func encodeProtocolTestFrame(t *testing.T, codec BodyCodec, kind FrameKind, method, invocationID string, body any) []byte {
 	t.Helper()
 
@@ -281,7 +334,7 @@ func encodeInvokeTestFrameRaw(t *testing.T, codec BodyCodec, kind FrameKind, met
 			t.Fatalf("validateMethodName returned error: %v", err)
 		}
 	}
-	if kind != FrameKindMessage || invocationID != "" {
+	if !isControlFrameKind(kind) && (kind != FrameKindMessage || invocationID != "") {
 		if err := validateInvocationID(invocationID); err != nil {
 			t.Fatalf("validateInvocationID returned error: %v", err)
 		}

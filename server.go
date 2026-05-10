@@ -82,6 +82,7 @@ type Config struct {
 	MaxPayloadSize       int64
 	SendConcurrency      int
 	PingInterval         time.Duration
+	PingTimeout          time.Duration
 }
 
 // Handler accepts websocket requests and dispatches lifecycle events to hubs.
@@ -91,14 +92,17 @@ type Handler struct {
 	logger   *slog.Logger
 	protocol *protocolConfig
 
-	registry        *connectionRegistry
-	sendConcurrency int
-	admissionMu     sync.Mutex
-	active          sync.WaitGroup
-	shuttingDown    atomic.Bool
-	online          atomic.Int64
-	shutdownOnce    sync.Once
-	shutdownErr     error
+	registry          *connectionRegistry
+	sendConcurrency   int
+	admissionMu       sync.Mutex
+	active            sync.WaitGroup
+	shuttingDown      atomic.Bool
+	online            atomic.Int64
+	shutdownOnce      sync.Once
+	shutdownErr       error
+	heartbeatWake     chan struct{}
+	heartbeatStop     chan struct{}
+	heartbeatStopOnce sync.Once
 }
 
 // SendResult describes a batch send operation outcome.
@@ -151,16 +155,23 @@ func NewHandler(cfg Config, factory HubFactory) (*Handler, error) {
 		cfg.ReadLimit = HeaderSize + MaxMethodNameLen + MaxInvocationIDLen + protocol.maxPayloadSize
 	}
 	cfg.PingInterval = normalizePingInterval(cfg.PingInterval)
+	cfg.PingTimeout = normalizePingTimeout(cfg.PingTimeout, cfg.PingInterval)
 	sendConcurrency := normalizeSendConcurrency(cfg.SendConcurrency)
 
-	return &Handler{
+	h := &Handler{
 		cfg:             cfg,
 		factory:         factory,
 		logger:          cfg.Logger,
 		protocol:        protocol,
 		registry:        newConnectionRegistry(),
 		sendConcurrency: sendConcurrency,
-	}, nil
+		heartbeatWake:   make(chan struct{}, 1),
+		heartbeatStop:   make(chan struct{}),
+	}
+	if h.heartbeatEnabled() {
+		go h.heartbeatLoop()
+	}
+	return h, nil
 }
 
 // ServeHTTP handles websocket upgrade requests.
@@ -432,6 +443,7 @@ func (h *Handler) Shutdown(ctx context.Context) error {
 }
 
 func (h *Handler) shutdown(ctx context.Context) error {
+	h.stopHeartbeatLoop()
 	drainingConnections := h.beginShutdown()
 	if err := h.waitConnectionsDrained(ctx, drainingConnections); err != nil {
 		h.closeDrainingConnections(drainingConnections)
@@ -485,6 +497,7 @@ func (h *Handler) addConnection(conn *Connection) bool {
 	h.active.Add(1)
 	h.registry.add(conn)
 	h.online.Add(1)
+	h.wakeHeartbeatLoop()
 	return true
 }
 
@@ -493,6 +506,7 @@ func (h *Handler) removeConnection(conn *Connection) {
 		return
 	}
 	h.online.Add(-1)
+	h.wakeHeartbeatLoop()
 }
 
 func (h *Handler) finishConnection() {
@@ -551,6 +565,79 @@ func (h *Handler) sendConnected(conn *Connection) error {
 	return conn.Send(conn.ctx, ConnectedMethod, body)
 }
 
+func (h *Handler) heartbeatEnabled() bool {
+	return h != nil && h.cfg.PingInterval > 0 && h.cfg.PingTimeout > 0
+}
+
+func (h *Handler) heartbeatLoop() {
+	for {
+		wait, ok := h.registry.nextExpiration(time.Now(), h.cfg.PingTimeout)
+		if !ok {
+			select {
+			case <-h.heartbeatWake:
+				continue
+			case <-h.heartbeatStop:
+				return
+			}
+		}
+
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+			h.closeExpiredIdleConnections()
+		case <-h.heartbeatWake:
+			stopTimer(timer)
+		case <-h.heartbeatStop:
+			stopTimer(timer)
+			return
+		}
+	}
+}
+
+func stopTimer(timer *time.Timer) {
+	if timer == nil || timer.Stop() {
+		return
+	}
+	select {
+	case <-timer.C:
+	default:
+	}
+}
+
+func (h *Handler) closeExpiredIdleConnections() {
+	expired := h.registry.expired(time.Now(), h.cfg.PingTimeout)
+	if len(expired) == 0 {
+		return
+	}
+	h.online.Add(-int64(len(expired)))
+	for _, conn := range expired {
+		h.logger.Warn("websocket connection heartbeat timed out",
+			slog.String("connection_id", conn.ID),
+			slog.String("remote_addr", remoteAddr(conn)),
+			slog.Duration("ping_timeout", h.cfg.PingTimeout),
+		)
+		conn.closeContext()
+		_ = conn.closeNow()
+	}
+	h.wakeHeartbeatLoop()
+}
+
+func (h *Handler) wakeHeartbeatLoop() {
+	if !h.heartbeatEnabled() {
+		return
+	}
+	select {
+	case h.heartbeatWake <- struct{}{}:
+	default:
+	}
+}
+
+func (h *Handler) stopHeartbeatLoop() {
+	h.heartbeatStopOnce.Do(func() {
+		close(h.heartbeatStop)
+	})
+}
+
 func (h *Handler) readLoop(conn *Connection, hub Hub) error {
 	messageHub, receivesMessages := hub.(MessageHub)
 	var dispatcher *hubDispatcher
@@ -588,6 +675,13 @@ func (h *Handler) readLoop(conn *Connection, hub Hub) error {
 			if err != nil {
 				_ = conn.CloseWithStatus(websocket.StatusProtocolError, "invalid signalg protocol frame")
 				return err
+			}
+			h.registry.touch(conn)
+			if msg.Kind == FrameKindPing {
+				return conn.Pong(conn.ctx)
+			}
+			if msg.Kind == FrameKindPong {
+				return nil
 			}
 			if receivesMessages {
 				return h.runHandlerOperation(conn, func() error {
@@ -788,6 +882,16 @@ func normalizePingInterval(d time.Duration) time.Duration {
 		return DefaultPingInterval
 	}
 	return d
+}
+
+func normalizePingTimeout(timeout, interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	if timeout <= 0 {
+		return 5 * interval
+	}
+	return timeout
 }
 
 func nextConnectionID() (string, error) {

@@ -156,6 +156,36 @@ func (c *Connection) CompleteError(ctx context.Context, invocationID string, err
 	return c.writeRawProtocolFrame(ctx, FrameKindError, "", invocationID, []byte(err.Error()))
 }
 
+// Ping writes one SignalG protocol-level heartbeat ping frame.
+func (c *Connection) Ping(ctx context.Context) error {
+	if c == nil || c.ws == nil {
+		return errors.New("signalg: nil websocket connection")
+	}
+	if c.protocol == nil {
+		return ErrUnsupportedCodec
+	}
+	if !c.beginSendOperation() {
+		return ErrHandlerShuttingDown
+	}
+	defer c.endOperation()
+	return c.writeRawProtocolFrame(ctx, FrameKindPing, "", "", nil)
+}
+
+// Pong writes one SignalG protocol-level heartbeat pong frame.
+func (c *Connection) Pong(ctx context.Context) error {
+	if c == nil || c.ws == nil {
+		return errors.New("signalg: nil websocket connection")
+	}
+	if c.protocol == nil {
+		return ErrUnsupportedCodec
+	}
+	if !c.beginSendOperation() {
+		return ErrHandlerShuttingDown
+	}
+	defer c.endOperation()
+	return c.writeRawProtocolFrame(ctx, FrameKindPong, "", "", nil)
+}
+
 func (c *Connection) writeEncodedProtocolFrame(ctx context.Context, kind FrameKind, method, invocationID string, body any) error {
 	if err := validateProtocolFrame(kind, method, invocationID); err != nil {
 		return err
@@ -197,6 +227,15 @@ func (c *Connection) writeRawProtocolFrame(ctx context.Context, kind FrameKind, 
 func validateProtocolFrame(kind FrameKind, method, invocationID string) error {
 	if err := validateFrameKind(kind); err != nil {
 		return err
+	}
+	if isControlFrameKind(kind) {
+		if method != "" {
+			return fmt.Errorf("%w: control frame method must be empty", ErrInvalidMethodName)
+		}
+		if invocationID != "" {
+			return fmt.Errorf("%w: control frame invocation id must be empty", ErrInvalidInvocationID)
+		}
+		return nil
 	}
 	if kind == FrameKindMessage || kind == FrameKindInvoke {
 		if err := validateMethodName(method); err != nil {
