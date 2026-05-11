@@ -277,13 +277,25 @@ func TestMessageHubReceivesProtocolMessage(t *testing.T) {
 	}
 }
 
-func TestHandlerRespondsToProtocolPingWithoutDispatching(t *testing.T) {
+func TestHandlerRespondsToProtocolPingWithOptionalNotificationWithoutDispatching(t *testing.T) {
 	messages := make(chan Message, 1)
+	pings := make(chan *Connection, 1)
+	pingStarted := make(chan struct{}, 1)
+	releasePing := make(chan struct{})
 	handler := newTestHandler(t, Config{}, func(*Connection) (Hub, error) {
-		return &recordingMessageHub{messages: messages}, nil
+		return &recordingPingHub{
+			recordingMessageHub: recordingMessageHub{messages: messages},
+			pings:               pings,
+			onPing: func(_ context.Context, conn *Connection) {
+				pingStarted <- struct{}{}
+				pings <- conn
+				<-releasePing
+			},
+		}, nil
 	})
 	server := httptest.NewServer(handler)
 	defer server.Close()
+	defer close(releasePing)
 
 	client := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
 	defer client.CloseNow()
@@ -293,12 +305,27 @@ func TestHandlerRespondsToProtocolPingWithoutDispatching(t *testing.T) {
 		t.Fatalf("client write: %v", err)
 	}
 
+	select {
+	case <-pingStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for ping callback to start")
+	}
+
 	msg := readProtocolMessage(t, handler, client)
 	if msg.Kind != FrameKindPong {
 		t.Fatalf("expected pong frame, got %s", msg.Kind)
 	}
 	if msg.Method != "" || msg.InvocationID != "" || len(msg.Payload) != 0 {
 		t.Fatalf("unexpected pong frame: %#v", msg)
+	}
+
+	select {
+	case conn := <-pings:
+		if conn == nil {
+			t.Fatal("expected ping callback connection")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for ping callback")
 	}
 
 	select {
@@ -1420,6 +1447,22 @@ func (h *recordingMessageHub) OnMessage(ctx context.Context, conn *Connection, m
 		h.messages <- msg
 	}
 	return nil
+}
+
+type recordingPingHub struct {
+	recordingMessageHub
+	pings  chan *Connection
+	onPing func(context.Context, *Connection)
+}
+
+func (h *recordingPingHub) OnPing(ctx context.Context, conn *Connection) {
+	if h.onPing != nil {
+		h.onPing(ctx, conn)
+		return
+	}
+	if h.pings != nil {
+		h.pings <- conn
+	}
 }
 
 type drainMessageHub struct {

@@ -68,6 +68,11 @@ type MessageHub interface {
 	OnMessage(ctx context.Context, conn *Connection, msg Message) error
 }
 
+// PingHub receives SignalG protocol-level heartbeat pings from a connection.
+type PingHub interface {
+	OnPing(ctx context.Context, conn *Connection)
+}
+
 // HubFactory creates one Hub instance for one websocket connection.
 type HubFactory func(conn *Connection) (Hub, error)
 
@@ -709,7 +714,7 @@ func (h *Handler) readLoop(conn *Connection, hub Hub) error {
 			}
 			h.registry.touch(conn)
 			if msg.Kind == FrameKindPing {
-				return conn.Pong(conn.ctx)
+				return h.handleProtocolPing(conn, hub)
 			}
 			if msg.Kind == FrameKindPong {
 				return nil
@@ -727,6 +732,19 @@ func (h *Handler) readLoop(conn *Connection, hub Hub) error {
 			return err
 		}
 	}
+}
+
+func (h *Handler) handleProtocolPing(conn *Connection, hub Hub) error {
+	if err := conn.Pong(conn.ctx); err != nil {
+		return err
+	}
+	if pingHub, ok := hub.(PingHub); ok {
+		_ = h.runHandlerOperation(conn, func() error {
+			pingHub.OnPing(conn.ctx, conn)
+			return nil
+		})
+	}
+	return nil
 }
 
 func (h *Handler) dispatchMessage(conn *Connection, hub Hub, dispatcher *hubDispatcher, msg Message) error {
