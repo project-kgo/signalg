@@ -376,6 +376,20 @@ func (h *Handler) SendUsers(ctx context.Context, userIDs []string, method string
 	return h.sendConnections(ctx, h.registry.userSnapshot(userIDs), method, payload)
 }
 
+// SendUsersRaw sends one message with an already-encoded payload to every active connection for the provided users.
+func (h *Handler) SendUsersRaw(ctx context.Context, userIDs []string, method string, payload []byte) SendResult {
+	if h == nil {
+		return SendResult{}
+	}
+	if err := h.prepareBatchRawPayload(method, payload); err != nil {
+		return SendResult{Err: err}
+	}
+	if h.shuttingDown.Load() {
+		return SendResult{Err: ErrHandlerShuttingDown}
+	}
+	return h.sendConnections(ctx, h.registry.userSnapshot(userIDs), method, payload)
+}
+
 // SendGroup sends one message to every active connection in group.
 func (h *Handler) SendGroup(ctx context.Context, group string, method string, body any) SendResult {
 	if h == nil {
@@ -395,6 +409,24 @@ func (h *Handler) SendGroup(ctx context.Context, group string, method string, bo
 	return h.sendConnections(ctx, h.registry.groupConnections(group), method, payload)
 }
 
+// SendGroupRaw sends one message with an already-encoded payload to every active connection in group.
+func (h *Handler) SendGroupRaw(ctx context.Context, group string, method string, payload []byte) SendResult {
+	if h == nil {
+		return SendResult{}
+	}
+	group = normalizeGroup(group)
+	if group == "" {
+		return SendResult{Err: ErrInvalidGroup}
+	}
+	if err := h.prepareBatchRawPayload(method, payload); err != nil {
+		return SendResult{Err: err}
+	}
+	if h.shuttingDown.Load() {
+		return SendResult{Err: ErrHandlerShuttingDown}
+	}
+	return h.sendConnections(ctx, h.registry.groupConnections(group), method, payload)
+}
+
 // SendAll sends one message to every active connection.
 func (h *Handler) SendAll(ctx context.Context, method string, body any) SendResult {
 	if h == nil {
@@ -402,6 +434,20 @@ func (h *Handler) SendAll(ctx context.Context, method string, body any) SendResu
 	}
 	payload, err := h.prepareBatchPayload(method, body)
 	if err != nil {
+		return SendResult{Err: err}
+	}
+	if h.shuttingDown.Load() {
+		return SendResult{Err: ErrHandlerShuttingDown}
+	}
+	return h.sendConnections(ctx, h.registry.allConnections(), method, payload)
+}
+
+// SendAllRaw sends one message with an already-encoded payload to every active connection.
+func (h *Handler) SendAllRaw(ctx context.Context, method string, payload []byte) SendResult {
+	if h == nil {
+		return SendResult{}
+	}
+	if err := h.prepareBatchRawPayload(method, payload); err != nil {
 		return SendResult{Err: err}
 	}
 	if h.shuttingDown.Load() {
@@ -862,14 +908,29 @@ func (s *Server) SendUsers(ctx context.Context, userIDs []string, method string,
 	return s.handler.SendUsers(ctx, userIDs, method, body)
 }
 
+// SendUsersRaw sends one message with an already-encoded payload to every active connection for the provided users.
+func (s *Server) SendUsersRaw(ctx context.Context, userIDs []string, method string, payload []byte) SendResult {
+	return s.handler.SendUsersRaw(ctx, userIDs, method, payload)
+}
+
 // SendGroup sends one message to every active connection in group.
 func (s *Server) SendGroup(ctx context.Context, group string, method string, body any) SendResult {
 	return s.handler.SendGroup(ctx, group, method, body)
 }
 
+// SendGroupRaw sends one message with an already-encoded payload to every active connection in group.
+func (s *Server) SendGroupRaw(ctx context.Context, group string, method string, payload []byte) SendResult {
+	return s.handler.SendGroupRaw(ctx, group, method, payload)
+}
+
 // SendAll sends one message to every active connection.
 func (s *Server) SendAll(ctx context.Context, method string, body any) SendResult {
 	return s.handler.SendAll(ctx, method, body)
+}
+
+// SendAllRaw sends one message with an already-encoded payload to every active connection.
+func (s *Server) SendAllRaw(ctx context.Context, method string, payload []byte) SendResult {
+	return s.handler.SendAllRaw(ctx, method, payload)
 }
 
 // AddToGroup adds conn to group.

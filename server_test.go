@@ -1,6 +1,7 @@
 package signalg
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -918,6 +919,28 @@ func TestHandlerSendAll(t *testing.T) {
 	assertProtocolMessage(t, handler, client2, "server.broadcast", protocolTestBody{Name: "all", Seq: 1})
 }
 
+func TestHandlerSendAllRaw(t *testing.T) {
+	connected := make(chan *Connection, 2)
+	handler := newTestHandler(t, Config{SendConcurrency: 1}, func(*Connection) (Hub, error) {
+		return &recordingHub{connected: connected}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client1 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client1.CloseNow()
+	client2 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client2.CloseNow()
+	receiveConnection(t, connected)
+	receiveConnection(t, connected)
+
+	payload := []byte{0x81, 0xa4, 'n', 'a', 'm', 'e', 0xa3, 'r', 'a', 'w'}
+	result := handler.SendAllRaw(context.Background(), "server.broadcast.raw", payload)
+	assertSendResult(t, result, 2, 2, 0)
+	assertRawProtocolMessage(t, handler, client1, "server.broadcast.raw", payload)
+	assertRawProtocolMessage(t, handler, client2, "server.broadcast.raw", payload)
+}
+
 func TestHandlerSendUsersDeduplicatesConnections(t *testing.T) {
 	connected := make(chan *Connection, 3)
 	handler := newTestHandler(t, Config{
@@ -951,6 +974,42 @@ func TestHandlerSendUsersDeduplicatesConnections(t *testing.T) {
 	assertProtocolMessage(t, handler, client1, "server.users", protocolTestBody{Name: "users", Seq: 2})
 	assertProtocolMessage(t, handler, client2, "server.users", protocolTestBody{Name: "users", Seq: 2})
 	assertProtocolMessage(t, handler, client3, "server.users", protocolTestBody{Name: "users", Seq: 2})
+}
+
+func TestHandlerSendUsersRawDeduplicatesConnections(t *testing.T) {
+	connected := make(chan *Connection, 3)
+	handler := newTestHandler(t, Config{
+		UserProvider: UserProviderFunc(func(r *http.Request) (string, error) {
+			return r.Header.Get("X-User-ID"), nil
+		}),
+	}, func(*Connection) (Hub, error) {
+		return &recordingHub{connected: connected}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client1 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, &websocket.DialOptions{
+		HTTPHeader: http.Header{"X-User-ID": []string{"user-1"}},
+	})
+	defer client1.CloseNow()
+	client2 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, &websocket.DialOptions{
+		HTTPHeader: http.Header{"X-User-ID": []string{"user-1"}},
+	})
+	defer client2.CloseNow()
+	client3 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, &websocket.DialOptions{
+		HTTPHeader: http.Header{"X-User-ID": []string{"user-2"}},
+	})
+	defer client3.CloseNow()
+	receiveConnection(t, connected)
+	receiveConnection(t, connected)
+	receiveConnection(t, connected)
+
+	payload := []byte{0x82, 0xa3, 's', 'e', 'q', 0x2a, 0xa3, 'r', 'a', 'w', 0xc3}
+	result := handler.SendUsersRaw(context.Background(), []string{"user-1", "user-2", "user-1", ""}, "server.users.raw", payload)
+	assertSendResult(t, result, 3, 3, 0)
+	assertRawProtocolMessage(t, handler, client1, "server.users.raw", payload)
+	assertRawProtocolMessage(t, handler, client2, "server.users.raw", payload)
+	assertRawProtocolMessage(t, handler, client3, "server.users.raw", payload)
 }
 
 func TestHandlerGroupIndexAndSendGroup(t *testing.T) {
@@ -1025,6 +1084,39 @@ func TestHandlerGroupIndexAndSendGroup(t *testing.T) {
 	receiveDisconnect(t, disconnected)
 	if got := handler.GroupOnline("room-2"); got != 0 {
 		t.Fatalf("expected room-2 online 0 after disconnect, got %d", got)
+	}
+}
+
+func TestHandlerSendGroupRaw(t *testing.T) {
+	connected := make(chan *Connection, 3)
+	handler := newTestHandler(t, Config{}, func(*Connection) (Hub, error) {
+		return &recordingHub{connected: connected}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client1 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client1.CloseNow()
+	client2 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client2.CloseNow()
+	conn1 := receiveConnection(t, connected)
+	conn2 := receiveConnection(t, connected)
+
+	if err := handler.AddToGroup(conn1, "room-raw"); err != nil {
+		t.Fatalf("AddToGroup conn1 returned error: %v", err)
+	}
+	if err := handler.AddToGroup(conn2, "room-raw"); err != nil {
+		t.Fatalf("AddToGroup conn2 returned error: %v", err)
+	}
+
+	payload := []byte{0xa9, 'r', 'a', 'w', '-', 'g', 'r', 'o', 'u', 'p'}
+	result := handler.SendGroupRaw(context.Background(), "room-raw", "server.group.raw", payload)
+	assertSendResult(t, result, 2, 2, 0)
+	assertRawProtocolMessage(t, handler, client1, "server.group.raw", payload)
+	assertRawProtocolMessage(t, handler, client2, "server.group.raw", payload)
+
+	if got := handler.SendGroupRaw(context.Background(), "", "server.group.raw", payload); !errors.Is(got.Err, ErrInvalidGroup) {
+		t.Fatalf("expected ErrInvalidGroup, got %v", got.Err)
 	}
 }
 
@@ -1563,6 +1655,18 @@ func assertProtocolMessage(t *testing.T, handler *Handler, client *websocket.Con
 	}
 	if got != want {
 		t.Fatalf("unexpected decoded body: got %#v want %#v", got, want)
+	}
+}
+
+func assertRawProtocolMessage(t *testing.T, handler *Handler, client *websocket.Conn, method string, want []byte) {
+	t.Helper()
+
+	msg := readProtocolMessage(t, handler, client)
+	if msg.Method != method {
+		t.Fatalf("expected method %s, got %q", method, msg.Method)
+	}
+	if !bytes.Equal(msg.Payload, want) {
+		t.Fatalf("unexpected raw payload: got %v want %v", msg.Payload, want)
 	}
 }
 

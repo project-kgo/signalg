@@ -34,6 +34,16 @@ func (h *Handler) prepareBatchPayload(method string, body any) ([]byte, error) {
 	return payload, nil
 }
 
+func (h *Handler) prepareBatchRawPayload(method string, payload []byte) error {
+	if h.protocol == nil {
+		return ErrUnsupportedCodec
+	}
+	if err := validateProtocolFrame(FrameKindMessage, method, ""); err != nil {
+		return err
+	}
+	return h.protocol.ensurePayloadSize(len(payload))
+}
+
 func (h *Handler) sendConnections(ctx context.Context, connections []*Connection, method string, payload []byte) SendResult {
 	if ctx == nil {
 		ctx = context.Background()
