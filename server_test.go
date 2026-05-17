@@ -1065,6 +1065,73 @@ func TestHandlerSendConnectionsRawDeduplicatesConnections(t *testing.T) {
 	assertNoProtocolMessage(t, handler, client3)
 }
 
+func TestHandlerCloseUsersDeduplicatesConnections(t *testing.T) {
+	connected := make(chan *Connection, 3)
+	disconnected := make(chan error, 3)
+	handler := newTestHandler(t, Config{
+		UserProvider: UserProviderFunc(func(r *http.Request) (string, error) {
+			return r.Header.Get("X-User-ID"), nil
+		}),
+		SendConcurrency: 1,
+	}, func(*Connection) (Hub, error) {
+		return &recordingHub{connected: connected, disconnected: disconnected}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client1 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, &websocket.DialOptions{
+		HTTPHeader: http.Header{"X-User-ID": []string{"user-1"}},
+	})
+	defer client1.CloseNow()
+	client2 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, &websocket.DialOptions{
+		HTTPHeader: http.Header{"X-User-ID": []string{"user-1"}},
+	})
+	defer client2.CloseNow()
+	client3 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, &websocket.DialOptions{
+		HTTPHeader: http.Header{"X-User-ID": []string{"user-2"}},
+	})
+	defer client3.CloseNow()
+	receiveConnection(t, connected)
+	receiveConnection(t, connected)
+	receiveConnection(t, connected)
+
+	result := handler.CloseUsers(context.Background(), []string{"user-1", "user-1", "", "missing"})
+	assertCloseResult(t, result, 2, 2, 0)
+	assertClientDisconnected(t, handler, client1)
+	assertClientDisconnected(t, handler, client2)
+	assertNoProtocolMessage(t, handler, client3)
+	receiveDisconnect(t, disconnected)
+	receiveDisconnect(t, disconnected)
+}
+
+func TestHandlerCloseConnectionsDeduplicatesConnections(t *testing.T) {
+	connected := make(chan *Connection, 3)
+	disconnected := make(chan error, 3)
+	handler := newTestHandler(t, Config{SendConcurrency: 1}, func(*Connection) (Hub, error) {
+		return &recordingHub{connected: connected, disconnected: disconnected}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client1 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client1.CloseNow()
+	client2 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client2.CloseNow()
+	client3 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client3.CloseNow()
+	conn1 := receiveConnection(t, connected)
+	conn2 := receiveConnection(t, connected)
+	receiveConnection(t, connected)
+
+	result := handler.CloseConnections(context.Background(), []string{conn1.ID, conn2.ID, conn1.ID, "", "missing"})
+	assertCloseResult(t, result, 2, 2, 0)
+	assertClientDisconnected(t, handler, client1)
+	assertClientDisconnected(t, handler, client2)
+	assertNoProtocolMessage(t, handler, client3)
+	receiveDisconnect(t, disconnected)
+	receiveDisconnect(t, disconnected)
+}
+
 func TestHandlerGroupIndexAndSendGroup(t *testing.T) {
 	connected := make(chan *Connection, 3)
 	disconnected := make(chan error, 3)
@@ -1777,6 +1844,44 @@ func assertSendResult(t *testing.T, result SendResult, matched, sent, failed int
 	}
 	if failed > 0 && result.Err == nil {
 		t.Fatal("expected send error")
+	}
+}
+
+func assertCloseResult(t *testing.T, result CloseResult, matched, closed, failed int) {
+	t.Helper()
+
+	if result.Matched != matched || result.Closed != closed || result.Failed != failed {
+		t.Fatalf("unexpected close result: got matched=%d closed=%d failed=%d err=%v, want matched=%d closed=%d failed=%d",
+			result.Matched, result.Closed, result.Failed, result.Err, matched, closed, failed)
+	}
+	if failed == 0 && result.Err != nil {
+		t.Fatalf("expected nil close error, got %v", result.Err)
+	}
+	if failed > 0 && result.Err == nil {
+		t.Fatal("expected close error")
+	}
+}
+
+func assertClientDisconnected(t *testing.T, handler *Handler, client *websocket.Conn) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for {
+		typ, frame, err := client.Read(ctx)
+		if err != nil {
+			return
+		}
+		if typ != websocket.MessageBinary {
+			t.Fatalf("expected binary message or disconnect, got %s", typ)
+		}
+		msg, err := handler.protocol.decodeFrame(frame)
+		if err != nil {
+			t.Fatalf("decodeFrame returned error: %v", err)
+		}
+		if msg.Method != ConnectedMethod {
+			t.Fatalf("expected disconnect after connected message, got %q", msg.Method)
+		}
 	}
 }
 

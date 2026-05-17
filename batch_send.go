@@ -2,8 +2,6 @@ package signalg
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"sync"
 )
 
@@ -97,12 +95,5 @@ func (h *Handler) sendConnections(ctx context.Context, connections []*Connection
 }
 
 func buildSendError(failed int, samples []error) error {
-	if failed == 0 {
-		return nil
-	}
-	joined := errors.Join(samples...)
-	if joined == nil {
-		return fmt.Errorf("signalg: failed to send %d connection(s)", failed)
-	}
-	return fmt.Errorf("signalg: failed to send %d connection(s): %w", failed, joined)
+	return buildBatchError("send", failed, samples)
 }

@@ -954,6 +954,16 @@ func (s *Server) SendConnectionsRaw(ctx context.Context, connectionIDs []string,
 	return s.handler.SendConnectionsRaw(ctx, connectionIDs, method, payload)
 }
 
+// CloseUsers immediately closes every active connection for the provided users.
+func (s *Server) CloseUsers(ctx context.Context, userIDs []string) CloseResult {
+	return s.handler.CloseUsers(ctx, userIDs)
+}
+
+// CloseConnections immediately closes active connections for the provided connection IDs.
+func (s *Server) CloseConnections(ctx context.Context, connectionIDs []string) CloseResult {
+	return s.handler.CloseConnections(ctx, connectionIDs)
+}
+
 // SendGroup sends one message to every active connection in group.
 func (s *Server) SendGroup(ctx context.Context, group string, method string, body any) SendResult {
 	return s.handler.SendGroup(ctx, group, method, body)
