@@ -1039,6 +1039,32 @@ func TestHandlerSendUsersRawDeduplicatesConnections(t *testing.T) {
 	assertRawProtocolMessage(t, handler, client3, "server.users.raw", payload)
 }
 
+func TestHandlerSendConnectionsRawDeduplicatesConnections(t *testing.T) {
+	connected := make(chan *Connection, 3)
+	handler := newTestHandler(t, Config{SendConcurrency: 1}, func(*Connection) (Hub, error) {
+		return &recordingHub{connected: connected}, nil
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	client1 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client1.CloseNow()
+	client2 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client2.CloseNow()
+	client3 := dialWebSocket(t, httpToWS(server.URL)+DefaultPath, nil)
+	defer client3.CloseNow()
+	conn1 := receiveConnection(t, connected)
+	conn2 := receiveConnection(t, connected)
+	receiveConnection(t, connected)
+
+	payload := []byte{0x82, 0xa3, 's', 'e', 'q', 0x2a, 0xa3, 'r', 'a', 'w', 0xc3}
+	result := handler.SendConnectionsRaw(context.Background(), []string{conn1.ID, conn2.ID, conn1.ID, "", "missing"}, "server.connections.raw", payload)
+	assertSendResult(t, result, 2, 2, 0)
+	assertRawProtocolMessage(t, handler, client1, "server.connections.raw", payload)
+	assertRawProtocolMessage(t, handler, client2, "server.connections.raw", payload)
+	assertNoProtocolMessage(t, handler, client3)
+}
+
 func TestHandlerGroupIndexAndSendGroup(t *testing.T) {
 	connected := make(chan *Connection, 3)
 	disconnected := make(chan error, 3)
@@ -1710,6 +1736,32 @@ func assertRawProtocolMessage(t *testing.T, handler *Handler, client *websocket.
 	}
 	if !bytes.Equal(msg.Payload, want) {
 		t.Fatalf("unexpected raw payload: got %v want %v", msg.Payload, want)
+	}
+}
+
+func assertNoProtocolMessage(t *testing.T, handler *Handler, client *websocket.Conn) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	for {
+		typ, frame, err := client.Read(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			t.Fatalf("client read: %v", err)
+		}
+		if typ != websocket.MessageBinary {
+			t.Fatalf("expected binary message, got %s", typ)
+		}
+		msg, err := handler.protocol.decodeFrame(frame)
+		if err != nil {
+			t.Fatalf("decodeFrame returned error: %v", err)
+		}
+		if msg.Method != ConnectedMethod {
+			t.Fatalf("expected no protocol message, got %q", msg.Method)
+		}
 	}
 }
 

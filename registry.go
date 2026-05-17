@@ -124,6 +124,40 @@ func (r *connectionRegistry) userConnections(userID string) []*Connection {
 	return copyConnectionSet(userConnections)
 }
 
+func (r *connectionRegistry) connectionSnapshot(connectionIDs []string) []*Connection {
+	if len(connectionIDs) == 0 {
+		return nil
+	}
+	if len(connectionIDs) == 1 {
+		connectionID := connectionIDs[0]
+		if connectionID == "" {
+			return nil
+		}
+		node, ok := r.connections.Get(connectionID)
+		if !ok || node == nil || node.conn == nil {
+			return nil
+		}
+		return []*Connection{node.conn}
+	}
+
+	connections := make([]*Connection, 0, len(connectionIDs))
+	seen := make(map[string]struct{}, len(connectionIDs))
+	for _, connectionID := range connectionIDs {
+		if connectionID == "" {
+			continue
+		}
+		if _, ok := seen[connectionID]; ok {
+			continue
+		}
+		seen[connectionID] = struct{}{}
+		node, ok := r.connections.Get(connectionID)
+		if ok && node != nil && node.conn != nil {
+			connections = append(connections, node.conn)
+		}
+	}
+	return connections
+}
+
 func (r *connectionRegistry) userSnapshot(userIDs []string) []*Connection {
 	if len(userIDs) == 0 {
 		return nil

@@ -395,6 +395,24 @@ func (h *Handler) SendUsersRaw(ctx context.Context, userIDs []string, method str
 	return h.sendConnections(ctx, h.registry.userSnapshot(userIDs), method, payload)
 }
 
+// SendConnectionsRaw sends one message with an already-encoded payload to every active connection for the provided connection IDs.
+func (h *Handler) SendConnectionsRaw(ctx context.Context, connectionIDs []string, method string, payload []byte) SendResult {
+	if h == nil {
+		return SendResult{}
+	}
+	return h.sendConnectionsRaw(ctx, connectionIDs, method, payload)
+}
+
+func (h *Handler) sendConnectionsRaw(ctx context.Context, connectionIDs []string, method string, payload []byte) SendResult {
+	if err := h.prepareBatchRawPayload(method, payload); err != nil {
+		return SendResult{Err: err}
+	}
+	if h.shuttingDown.Load() {
+		return SendResult{Err: ErrHandlerShuttingDown}
+	}
+	return h.sendConnections(ctx, h.registry.connectionSnapshot(connectionIDs), method, payload)
+}
+
 // SendGroup sends one message to every active connection in group.
 func (h *Handler) SendGroup(ctx context.Context, group string, method string, body any) SendResult {
 	if h == nil {
@@ -929,6 +947,11 @@ func (s *Server) SendUsers(ctx context.Context, userIDs []string, method string,
 // SendUsersRaw sends one message with an already-encoded payload to every active connection for the provided users.
 func (s *Server) SendUsersRaw(ctx context.Context, userIDs []string, method string, payload []byte) SendResult {
 	return s.handler.SendUsersRaw(ctx, userIDs, method, payload)
+}
+
+// SendConnectionsRaw sends one message with an already-encoded payload to every active connection for the provided connection IDs.
+func (s *Server) SendConnectionsRaw(ctx context.Context, connectionIDs []string, method string, payload []byte) SendResult {
+	return s.handler.SendConnectionsRaw(ctx, connectionIDs, method, payload)
 }
 
 // SendGroup sends one message to every active connection in group.
