@@ -1963,7 +1963,7 @@ func httpToWS(url string) string {
 	return "ws" + strings.TrimPrefix(url, "http")
 }
 
-func TestConnectionRegistryExpiresFromLastSeenListHead(t *testing.T) {
+func TestConnectionRegistryExpires(t *testing.T) {
 	registry := newConnectionRegistry()
 	active := &Connection{ID: "active", UserID: "user-1"}
 	idle := &Connection{ID: "idle", UserID: "user-1"}
@@ -1971,17 +1971,17 @@ func TestConnectionRegistryExpiresFromLastSeenListHead(t *testing.T) {
 	registry.add(idle)
 
 	now := time.Now()
-	if node, ok := registry.connections.Get(connectionKey(active)); ok {
-		node.lastSeen = now.Add(-time.Minute)
+	if entry, ok := registry.connections.Get(connectionKey(active)); ok {
+		entry.lastSeen.Store(now.Add(-time.Minute).UnixNano())
 	}
-	if node, ok := registry.connections.Get(connectionKey(idle)); ok {
-		node.lastSeen = now.Add(-time.Minute)
+	if entry, ok := registry.connections.Get(connectionKey(idle)); ok {
+		entry.lastSeen.Store(now.Add(-time.Minute).UnixNano())
 	}
 	registry.touch(active)
 
 	expired := registry.expired(time.Now(), time.Second)
 	if len(expired) != 1 || expired[0] != idle {
-		t.Fatalf("expected only idle connection to expire from list head, got %#v", expired)
+		t.Fatalf("expected only idle connection to expire, got %#v", expired)
 	}
 	if connections := registry.allConnections(); len(connections) != 1 || connections[0] != active {
 		t.Fatalf("expected active connection to remain after touch, got %#v", connections)

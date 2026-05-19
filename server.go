@@ -671,7 +671,7 @@ func (h *Handler) heartbeatEnabled() bool {
 
 func (h *Handler) heartbeatLoop() {
 	for {
-		wait, ok := h.registry.nextExpiration(time.Now(), h.cfg.PingTimeout)
+		wait, ok := h.registry.nextExpiration(h.cfg.PingTimeout)
 		if !ok {
 			select {
 			case <-h.heartbeatWake:
