@@ -23,7 +23,7 @@ func (h *Handler) CloseUsers(ctx context.Context, userIDs []string) CloseResult 
 	if h.shuttingDown.Load() {
 		return CloseResult{Err: ErrHandlerShuttingDown}
 	}
-	return h.closeConnections(ctx, h.registry.userSnapshot(userIDs))
+	return h.closeConnections(ctx, h.registry.userSnapshotPooled(userIDs))
 }
 
 // CloseConnections immediately closes active connections for the provided connection IDs.
@@ -34,13 +34,16 @@ func (h *Handler) CloseConnections(ctx context.Context, connectionIDs []string) 
 	if h.shuttingDown.Load() {
 		return CloseResult{Err: ErrHandlerShuttingDown}
 	}
-	return h.closeConnections(ctx, h.registry.connectionSnapshot(connectionIDs))
+	return h.closeConnections(ctx, h.registry.connectionSnapshotPooled(connectionIDs))
 }
 
-func (h *Handler) closeConnections(ctx context.Context, connections []*Connection) CloseResult {
+func (h *Handler) closeConnections(ctx context.Context, snapshot pooledConnections) CloseResult {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	defer snapshot.release()
+
+	connections := snapshot.connections
 	result := CloseResult{Matched: len(connections)}
 	if len(connections) == 0 {
 		return result

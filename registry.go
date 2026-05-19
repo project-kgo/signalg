@@ -7,12 +7,23 @@ import (
 	"time"
 
 	"github.com/kanengo/ku/mapx"
+	"github.com/kanengo/ku/poolx/slicepool"
 )
 
 const registryShardNum = 64
 
 type connectionSet = mapx.ShardMap[string, *Connection]
 type groupSet = mapx.ShardMap[string, struct{}]
+
+var connectionSlicePool = &slicepool.Pool[*Connection]{}
+
+type pooledConnections struct {
+	connections []*Connection
+}
+
+func (p pooledConnections) release() {
+	putConnectionSlice(p.connections)
+}
 
 type connectionRegistry struct {
 	connections    *mapx.ShardMap[string, *connectionNode]
@@ -108,6 +119,20 @@ func (r *connectionRegistry) allConnections() []*Connection {
 	return connections
 }
 
+func (r *connectionRegistry) allConnectionsPooled() pooledConnections {
+	if r.connections.Len() == 0 {
+		return pooledConnections{}
+	}
+	connections := getConnectionSlice(r.connections.Len())
+	r.connections.Range(func(_ string, node *connectionNode) bool {
+		if node != nil && node.conn != nil {
+			connections = append(connections, node.conn)
+		}
+		return true
+	})
+	return pooledConnections{connections: connections}
+}
+
 func (r *connectionRegistry) userOnline(userID string) int {
 	userConnections, ok := r.userConnIndex.Get(userID)
 	if !ok {
@@ -158,6 +183,42 @@ func (r *connectionRegistry) connectionSnapshot(connectionIDs []string) []*Conne
 	return connections
 }
 
+func (r *connectionRegistry) connectionSnapshotPooled(connectionIDs []string) pooledConnections {
+	if len(connectionIDs) == 0 {
+		return pooledConnections{}
+	}
+	if len(connectionIDs) == 1 {
+		connectionID := connectionIDs[0]
+		if connectionID == "" {
+			return pooledConnections{}
+		}
+		node, ok := r.connections.Get(connectionID)
+		if !ok || node == nil || node.conn == nil {
+			return pooledConnections{}
+		}
+		connections := getConnectionSlice(1)
+		connections = append(connections, node.conn)
+		return pooledConnections{connections: connections}
+	}
+
+	connections := getConnectionSlice(len(connectionIDs))
+	seen := make(map[string]struct{}, len(connectionIDs))
+	for _, connectionID := range connectionIDs {
+		if connectionID == "" {
+			continue
+		}
+		if _, ok := seen[connectionID]; ok {
+			continue
+		}
+		seen[connectionID] = struct{}{}
+		node, ok := r.connections.Get(connectionID)
+		if ok && node != nil && node.conn != nil {
+			connections = append(connections, node.conn)
+		}
+	}
+	return pooledConnections{connections: connections}
+}
+
 func (r *connectionRegistry) userSnapshot(userIDs []string) []*Connection {
 	if len(userIDs) == 0 {
 		return nil
@@ -205,6 +266,59 @@ func (r *connectionRegistry) userSnapshot(userIDs []string) []*Connection {
 		})
 	}
 	return connections
+}
+
+func (r *connectionRegistry) userSnapshotPooled(userIDs []string) pooledConnections {
+	if len(userIDs) == 0 {
+		return pooledConnections{}
+	}
+	if len(userIDs) == 1 {
+		userID := userIDs[0]
+		if userID == "" {
+			return pooledConnections{}
+		}
+		userConnections, ok := r.userConnIndex.Get(userID)
+		if !ok {
+			return pooledConnections{}
+		}
+		return copyConnectionSetPooled(userConnections)
+	}
+
+	total := 0
+	for _, userID := range userIDs {
+		if userID == "" {
+			continue
+		}
+		if userConnections, ok := r.userConnIndex.Get(userID); ok {
+			total += userConnections.Len()
+		}
+	}
+	if total == 0 {
+		return pooledConnections{}
+	}
+
+	connections := getConnectionSlice(total)
+	seen := make(map[string]struct{}, total)
+	for _, userID := range userIDs {
+		if userID == "" {
+			continue
+		}
+		userConnections, ok := r.userConnIndex.Get(userID)
+		if !ok {
+			continue
+		}
+		userConnections.Range(func(connKey string, conn *Connection) bool {
+			if _, ok := seen[connKey]; ok {
+				return true
+			}
+			seen[connKey] = struct{}{}
+			if conn != nil {
+				connections = append(connections, conn)
+			}
+			return true
+		})
+	}
+	return pooledConnections{connections: connections}
 }
 
 func (r *connectionRegistry) addToGroup(conn *Connection, group string) error {
@@ -368,6 +482,14 @@ func (r *connectionRegistry) groupConnections(group string) []*Connection {
 	return copyConnectionSet(groupConnections)
 }
 
+func (r *connectionRegistry) groupConnectionsPooled(group string) pooledConnections {
+	groupConnections, ok := r.groupConnIndex.Get(group)
+	if !ok {
+		return pooledConnections{}
+	}
+	return copyConnectionSetPooled(groupConnections)
+}
+
 func (r *connectionRegistry) connectionSetFor(index *mapx.ShardMap[string, *connectionSet], indexKey string) *connectionSet {
 	if connections, ok := index.Get(indexKey); ok {
 		return connections
@@ -424,6 +546,36 @@ func copyConnectionSet(set *connectionSet) []*Connection {
 		return true
 	})
 	return connections
+}
+
+func copyConnectionSetPooled(set *connectionSet) pooledConnections {
+	if set == nil {
+		return pooledConnections{}
+	}
+	connections := getConnectionSlice(set.Len())
+	set.Range(func(_ string, conn *Connection) bool {
+		if conn != nil {
+			connections = append(connections, conn)
+		}
+		return true
+	})
+	return pooledConnections{connections: connections}
+}
+
+func getConnectionSlice(size int) []*Connection {
+	if size <= 0 {
+		return nil
+	}
+	return connectionSlicePool.Get(size)[:0]
+}
+
+func putConnectionSlice(connections []*Connection) {
+	if cap(connections) == 0 {
+		return
+	}
+	backing := connections[:cap(connections)]
+	clear(backing)
+	connectionSlicePool.Put(backing[:0])
 }
 
 func newConnectionMap() *mapx.ShardMap[string, *connectionNode] {

@@ -1309,7 +1309,9 @@ func TestHandlerBatchSendErrors(t *testing.T) {
 		if err != nil {
 			t.Fatalf("prepareBatchPayload returned error: %v", err)
 		}
-		result := handler.sendConnections(context.Background(), []*Connection{conn, &Connection{ID: "broken"}}, "server.partial", payload)
+		connections := getConnectionSlice(2)
+		connections = append(connections, conn, &Connection{ID: "broken"})
+		result := handler.sendConnections(context.Background(), pooledConnections{connections: connections}, "server.partial", payload)
 		assertSendResult(t, result, 2, 1, 1)
 		if result.Err == nil {
 			t.Fatal("expected aggregate send error")
@@ -1983,6 +1985,21 @@ func TestConnectionRegistryExpiresFromLastSeenListHead(t *testing.T) {
 	}
 	if connections := registry.allConnections(); len(connections) != 1 || connections[0] != active {
 		t.Fatalf("expected active connection to remain after touch, got %#v", connections)
+	}
+}
+
+func TestPutConnectionSliceClearsReferences(t *testing.T) {
+	conn := &Connection{ID: "pooled"}
+	connections := getConnectionSlice(1)
+	connections = append(connections, conn)
+	backing := connections[:cap(connections)]
+
+	putConnectionSlice(connections)
+
+	for i, got := range backing {
+		if got != nil {
+			t.Fatalf("expected pooled connection slice slot %d to be nil, got %p", i, got)
+		}
 	}
 }
 

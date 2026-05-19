@@ -378,7 +378,7 @@ func (h *Handler) SendUsers(ctx context.Context, userIDs []string, method string
 	if h.shuttingDown.Load() {
 		return SendResult{Err: ErrHandlerShuttingDown}
 	}
-	return h.sendConnections(ctx, h.registry.userSnapshot(userIDs), method, payload)
+	return h.sendConnections(ctx, h.registry.userSnapshotPooled(userIDs), method, payload)
 }
 
 // SendUsersRaw sends one message with an already-encoded payload to every active connection for the provided users.
@@ -392,7 +392,7 @@ func (h *Handler) SendUsersRaw(ctx context.Context, userIDs []string, method str
 	if h.shuttingDown.Load() {
 		return SendResult{Err: ErrHandlerShuttingDown}
 	}
-	return h.sendConnections(ctx, h.registry.userSnapshot(userIDs), method, payload)
+	return h.sendConnections(ctx, h.registry.userSnapshotPooled(userIDs), method, payload)
 }
 
 // SendConnectionsRaw sends one message with an already-encoded payload to every active connection for the provided connection IDs.
@@ -410,7 +410,7 @@ func (h *Handler) sendConnectionsRaw(ctx context.Context, connectionIDs []string
 	if h.shuttingDown.Load() {
 		return SendResult{Err: ErrHandlerShuttingDown}
 	}
-	return h.sendConnections(ctx, h.registry.connectionSnapshot(connectionIDs), method, payload)
+	return h.sendConnections(ctx, h.registry.connectionSnapshotPooled(connectionIDs), method, payload)
 }
 
 // SendGroup sends one message to every active connection in group.
@@ -429,7 +429,7 @@ func (h *Handler) SendGroup(ctx context.Context, group string, method string, bo
 	if h.shuttingDown.Load() {
 		return SendResult{Err: ErrHandlerShuttingDown}
 	}
-	return h.sendConnections(ctx, h.registry.groupConnections(group), method, payload)
+	return h.sendConnections(ctx, h.registry.groupConnectionsPooled(group), method, payload)
 }
 
 // SendGroupRaw sends one message with an already-encoded payload to every active connection in group.
@@ -447,7 +447,7 @@ func (h *Handler) SendGroupRaw(ctx context.Context, group string, method string,
 	if h.shuttingDown.Load() {
 		return SendResult{Err: ErrHandlerShuttingDown}
 	}
-	return h.sendConnections(ctx, h.registry.groupConnections(group), method, payload)
+	return h.sendConnections(ctx, h.registry.groupConnectionsPooled(group), method, payload)
 }
 
 // SendAll sends one message to every active connection.
@@ -462,7 +462,7 @@ func (h *Handler) SendAll(ctx context.Context, method string, body any) SendResu
 	if h.shuttingDown.Load() {
 		return SendResult{Err: ErrHandlerShuttingDown}
 	}
-	return h.sendConnections(ctx, h.registry.allConnections(), method, payload)
+	return h.sendConnections(ctx, h.registry.allConnectionsPooled(), method, payload)
 }
 
 // SendAllRaw sends one message with an already-encoded payload to every active connection.
@@ -476,7 +476,7 @@ func (h *Handler) SendAllRaw(ctx context.Context, method string, payload []byte)
 	if h.shuttingDown.Load() {
 		return SendResult{Err: ErrHandlerShuttingDown}
 	}
-	return h.sendConnections(ctx, h.registry.allConnections(), method, payload)
+	return h.sendConnections(ctx, h.registry.allConnectionsPooled(), method, payload)
 }
 
 // AddToGroup adds conn to group.

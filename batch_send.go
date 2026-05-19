@@ -42,10 +42,13 @@ func (h *Handler) prepareBatchRawPayload(method string, payload []byte) error {
 	return h.protocol.ensurePayloadSize(len(payload))
 }
 
-func (h *Handler) sendConnections(ctx context.Context, connections []*Connection, method string, payload []byte) SendResult {
+func (h *Handler) sendConnections(ctx context.Context, snapshot pooledConnections, method string, payload []byte) SendResult {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	defer snapshot.release()
+
+	connections := snapshot.connections
 	result := SendResult{Matched: len(connections)}
 	if len(connections) == 0 {
 		return result
