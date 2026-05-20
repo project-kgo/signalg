@@ -11,7 +11,10 @@ import (
 	"github.com/kanengo/ku/poolx/slicepool"
 )
 
-const registryShardNum = 64
+const (
+	shardNumLarge = 256
+	shardNumSmall = 8
+)
 
 type connectionSet = mapx.ShardMap[string, *Connection]
 
@@ -26,9 +29,10 @@ func (p pooledConnections) release() {
 }
 
 type registryEntry struct {
+	mu       sync.Mutex
 	conn     *Connection
 	lastSeen atomic.Int64
-	groups   map[string]struct{} // protected by connLocks
+	groups   map[string]struct{}
 }
 
 type connectionRegistry struct {
@@ -36,7 +40,6 @@ type connectionRegistry struct {
 	userConnIndex  *mapx.ShardMap[string, *connectionSet]
 	groupConnIndex *mapx.ShardMap[string, *connectionSet]
 
-	connLocks      stripedMutexes
 	indexInitLocks stripedMutexes
 }
 
@@ -53,8 +56,6 @@ func (r *connectionRegistry) add(conn *Connection) {
 		return
 	}
 	connKey := connectionKey(conn)
-	unlockConn := r.connLocks.lock(connKey)
-	defer unlockConn()
 
 	entry := &registryEntry{
 		conn:   conn,
@@ -65,6 +66,15 @@ func (r *connectionRegistry) add(conn *Connection) {
 	if conn.UserID != "" {
 		r.connectionSetFor(r.userConnIndex, conn.UserID).Set(connKey, conn)
 	}
+
+	entry.mu.Lock()
+	current, ok := r.connections.Get(connKey)
+	if !ok || current != entry {
+		if conn.UserID != "" {
+			r.removeConnectionFromIndex(r.userConnIndex, conn.UserID, connKey)
+		}
+	}
+	entry.mu.Unlock()
 }
 
 func (r *connectionRegistry) remove(conn *Connection) bool {
@@ -72,13 +82,14 @@ func (r *connectionRegistry) remove(conn *Connection) bool {
 		return false
 	}
 	connKey := connectionKey(conn)
-	unlockConn := r.connLocks.lock(connKey)
-	defer unlockConn()
 
 	entry, ok := r.connections.Get(connKey)
 	if !ok || entry.conn != conn {
 		return false
 	}
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
 	r.connections.Delete(connKey)
 	if entry.conn.UserID != "" {
 		r.removeConnectionFromIndex(r.userConnIndex, entry.conn.UserID, connKey)
@@ -315,13 +326,14 @@ func (r *connectionRegistry) addToGroup(conn *Connection, group string) error {
 	}
 
 	connKey := connectionKey(conn)
-	unlockConn := r.connLocks.lock(connKey)
-	defer unlockConn()
 
 	entry, ok := r.connections.Get(connKey)
 	if !ok || entry.conn != conn {
 		return ErrConnectionNotFound
 	}
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
 	entry.groups[group] = struct{}{}
 	r.connectionSetFor(r.groupConnIndex, group).Set(connKey, conn)
 	return nil
@@ -337,13 +349,14 @@ func (r *connectionRegistry) removeFromGroup(conn *Connection, group string) err
 	}
 
 	connKey := connectionKey(conn)
-	unlockConn := r.connLocks.lock(connKey)
-	defer unlockConn()
 
 	entry, ok := r.connections.Get(connKey)
 	if !ok || entry.conn != conn {
 		return ErrConnectionNotFound
 	}
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
 	delete(entry.groups, group)
 	r.removeConnectionFromIndex(r.groupConnIndex, group, connKey)
 	return nil
@@ -354,13 +367,14 @@ func (r *connectionRegistry) removeFromAllGroups(conn *Connection) {
 		return
 	}
 	connKey := connectionKey(conn)
-	unlockConn := r.connLocks.lock(connKey)
-	defer unlockConn()
 
 	entry, ok := r.connections.Get(connKey)
 	if !ok {
 		return
 	}
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+
 	for group := range entry.groups {
 		r.removeConnectionFromIndex(r.groupConnIndex, group, connKey)
 		delete(entry.groups, group)
@@ -402,10 +416,10 @@ func (r *connectionRegistry) expired(now time.Time, timeout time.Duration) []*Co
 	expiredConns := make([]*Connection, 0, len(expiredKeys))
 	for i, key := range expiredKeys {
 		entry := expiredEntries[i]
-		unlock := r.connLocks.lock(key)
+		entry.mu.Lock()
 		current, ok := r.connections.Get(key)
 		if !ok || current != entry || entry.lastSeen.Load() >= deadlineNano {
-			unlock()
+			entry.mu.Unlock()
 			continue
 		}
 		r.connections.Delete(key)
@@ -415,7 +429,7 @@ func (r *connectionRegistry) expired(now time.Time, timeout time.Duration) []*Co
 		for group := range entry.groups {
 			r.removeConnectionFromIndex(r.groupConnIndex, group, key)
 		}
-		unlock()
+		entry.mu.Unlock()
 		expiredConns = append(expiredConns, entry.conn)
 	}
 	return expiredConns
@@ -477,6 +491,14 @@ func (r *connectionRegistry) removeConnectionFromIndex(index *mapx.ShardMap[stri
 		return
 	}
 	connections.Delete(connKey)
+	if connections.Len() == 0 {
+		unlock := r.indexInitLocks.lock(indexKey)
+		connections, ok := index.Get(indexKey)
+		if ok && connections.Len() == 0 {
+			index.Delete(indexKey)
+		}
+		unlock()
+	}
 }
 
 func copyConnectionSet(set *connectionSet) []*Connection {
@@ -525,19 +547,19 @@ func putConnectionSlice(connections []*Connection) {
 
 func newConnectionMap() *mapx.ShardMap[string, *registryEntry] {
 	return mapx.NewShardMap(mapx.ShardMapOptions[string, *registryEntry]{
-		ShardNum: registryShardNum,
+		ShardNum: shardNumLarge,
 	})
 }
 
 func newConnectionSetIndex() *mapx.ShardMap[string, *connectionSet] {
 	return mapx.NewShardMap(mapx.ShardMapOptions[string, *connectionSet]{
-		ShardNum: registryShardNum,
+		ShardNum: shardNumLarge,
 	})
 }
 
 func newConnectionSet() *connectionSet {
 	return mapx.NewShardMap(mapx.ShardMapOptions[string, *Connection]{
-		ShardNum: registryShardNum,
+		ShardNum: shardNumSmall,
 	})
 }
 
@@ -553,7 +575,7 @@ func normalizeGroup(group string) string {
 }
 
 type stripedMutexes struct {
-	locks [registryShardNum]sync.Mutex
+	locks [shardNumLarge]sync.Mutex
 }
 
 func (s *stripedMutexes) lock(key string) func() {
@@ -573,5 +595,5 @@ func lockShard(key string) int {
 		hash ^= uint64(key[i])
 		hash *= prime64
 	}
-	return int(hash % registryShardNum)
+	return int(hash % shardNumLarge)
 }
